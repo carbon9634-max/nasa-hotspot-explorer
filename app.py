@@ -128,7 +128,7 @@ if not filtered.empty:
         "ScatterplotLayer",
         data=map_data,
         get_position="[longitude, latitude]",
-        get_radius=3,
+        get_radius=1.5,
         radius_units="pixels",
         get_fill_color=[255, 100, 0, 180],
         pickable=True,
@@ -147,7 +147,7 @@ if not filtered.empty:
     deck = pdk.Deck(
         layers=[hotspot_layer],
         initial_view_state=view_state,
-        map_style="light",
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
         tooltip={
             "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
         }
