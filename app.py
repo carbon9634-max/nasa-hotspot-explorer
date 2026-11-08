@@ -145,13 +145,13 @@ if not filtered.empty:
 
     # Create map
    deck = pdk.Deck(
-    layers=[hotspot_layer],
-    initial_view_state=view_state,
-    map_provider="carto",
-    map_style="road",
-    tooltip={
-        "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
-    }
+       layers=[hotspot_layer],
+       initial_view_state=view_state,
+       map_provider="carto",
+       map_style="road",
+       tooltip={
+           "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
+       }
 )
 
 st.pydeck_chart(deck, use_container_width=True)
