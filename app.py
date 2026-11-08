@@ -144,14 +144,17 @@ if not filtered.empty:
     )
 
     # Create map
-    deck = pdk.Deck(
-        layers=[hotspot_layer],
-        initial_view_state=view_state,
-        map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
-        tooltip={
-            "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
-        }
-    )
+   deck = pdk.Deck(
+    layers=[hotspot_layer],
+    initial_view_state=view_state,
+    map_provider="carto",
+    map_style="road",
+    tooltip={
+        "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
+    }
+)
+
+st.pydeck_chart(deck, use_container_width=True)
 
     st.pydeck_chart(deck, use_container_width=True)
 
