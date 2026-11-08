@@ -136,16 +136,16 @@ if not filtered.empty:
     ]
 
     # Create hotspot layer
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=map_data,
-        get_position="[longitude, latitude]",
-        get_radius=5,
-        radius_units="pixels",
-        get_fill_color=[255, 80, 30, 200],
-        pickable=True,
-    )
-
+    hotspot_layer = pdk.Layer(
+    "ScatterplotLayer",
+    data=app_data,
+    get_position="[longitude, latitude]",
+    get_radius=3,
+    radius_units="pixels",
+    get_fill_color=[255, 100, 0, 180],
+    pickable=True,
+    auto_highlight=True,
+)
     # Global map view
     view = pdk.ViewState(
         latitude=0,
@@ -156,15 +156,11 @@ if not filtered.empty:
 
     # Create map
     deck = pdk.Deck(
-        layers=[layer],
-        initial_view_state=view,
+        layers=[hotspot_layer],
+        initial_view_state=view_state,
         tooltip={
-            "html": """
-            <b>Sensor:</b> {sensor}<br/>
-            <b>Date:</b> {acq_date}<br/>
-            <b>FRP:</b> {frp} MW<br/>
-            <b>Satellite:</b> {satellite}
-            """
+                    "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
+ 
         }
     )
 
