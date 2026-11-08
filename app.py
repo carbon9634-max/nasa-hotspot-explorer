@@ -108,6 +108,12 @@ col3.metric(
 # -------------------------
 # 7. FRP distribution
 # -------------------------
+
+    
+# -------------------------
+# 7. Global hotspot map
+# -------------------------
+
 st.subheader("Global Hotspot Map")
 
 if not filtered.empty:
@@ -117,37 +123,20 @@ if not filtered.empty:
         subset=["latitude", "longitude"]
     ).copy()
 
-    # Make sure coordinates are numeric
-    map_data["latitude"] = pd.to_numeric(
-        map_data["latitude"], errors="coerce"
-    )
-    map_data["longitude"] = pd.to_numeric(
-        map_data["longitude"], errors="coerce"
-    )
-
-    # Remove invalid coordinates
-    map_data = map_data.dropna(
-        subset=["latitude", "longitude"]
-    )
-
-    map_data = map_data[
-        map_data["latitude"].between(-90, 90) &
-        map_data["longitude"].between(-180, 180)
-    ]
-
-    # Create hotspot layer
+    # Create hotspot layer with small, equal-sized dots
     hotspot_layer = pdk.Layer(
-    "ScatterplotLayer",
-    data=app_data,
-    get_position="[longitude, latitude]",
-    get_radius=3,
-    radius_units="pixels",
-    get_fill_color=[255, 100, 0, 180],
-    pickable=True,
-    auto_highlight=True,
-)
+        "ScatterplotLayer",
+        data=map_data,
+        get_position="[longitude, latitude]",
+        get_radius=3,
+        radius_units="pixels",
+        get_fill_color=[255, 100, 0, 180],
+        pickable=True,
+        auto_highlight=True,
+    )
+
     # Global map view
-    view = pdk.ViewState(
+    view_state = pdk.ViewState(
         latitude=0,
         longitude=0,
         zoom=1,
@@ -158,9 +147,9 @@ if not filtered.empty:
     deck = pdk.Deck(
         layers=[hotspot_layer],
         initial_view_state=view_state,
+        map_style="light",
         tooltip={
-                    "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
- 
+            "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
         }
     )
 
@@ -170,6 +159,8 @@ if not filtered.empty:
 
 else:
     st.warning("No observations match your selected filters.")
+
+    
 
 # -------------------------
 # 8. Daily observations
