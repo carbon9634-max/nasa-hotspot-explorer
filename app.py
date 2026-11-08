@@ -147,7 +147,7 @@ if not filtered.empty:
     deck = pdk.Deck(
         layers=[hotspot_layer],
         initial_view_state=view_state,
-        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        map_style="https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json",
         tooltip={
             "text": "Latitude: {latitude}\nLongitude: {longitude}\nFRP: {frp}"
         }
