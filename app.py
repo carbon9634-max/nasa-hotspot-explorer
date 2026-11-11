@@ -65,8 +65,11 @@ def load_data(file_path):
     )
 
     numeric_columns = [
-        "latitude", "longitude", "frp",
-        "brightness", "confidence"
+        "latitude",
+        "longitude",
+        "brightness",
+        "frp",
+        "confidence"
     ]
 
     for col in numeric_columns:
@@ -82,8 +85,42 @@ def load_data(file_path):
     return df
 
 
+def prepare_uploaded_data(uploaded_file):
+    df = pd.read_csv(uploaded_file)
+
+    df.columns = df.columns.str.lower().str.strip()
+
+    df["acq_date"] = pd.to_datetime(
+        df["acq_date"], errors="coerce"
+    )
+
+    numeric_columns = [
+        "latitude",
+        "longitude",
+        "brightness",
+        "frp",
+        "confidence"
+    ]
+
+    for col in numeric_columns:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col], errors="coerce"
+            )
+
+    return df.dropna(
+        subset=["latitude", "longitude", "acq_date"]
+    )
+
+
+# ==========================================
+# 4. SIDEBAR
+# ==========================================
+
 st.sidebar.title("🔥 NASA FireWatch")
 st.sidebar.caption("Global Satellite Fire Monitoring")
+
+st.sidebar.divider()
 
 uploaded_file = st.sidebar.file_uploader(
     "Upload hotspot CSV (optional)",
@@ -94,30 +131,13 @@ data_path = Path(__file__).parent / "app_data.csv"
 
 try:
     if uploaded_file is not None:
-        df = pd.read_csv(uploaded_file)
-        df.columns = df.columns.str.lower().str.strip()
+        df = prepare_uploaded_data(uploaded_file)
 
-        df["acq_date"] = pd.to_datetime(
-            df["acq_date"], errors="coerce"
-        )
-
-        for col in [
-            "latitude", "longitude", "frp",
-            "brightness", "confidence"
-        ]:
-            if col in df.columns:
-                df[col] = pd.to_numeric(
-                    df[col], errors="coerce"
-                )
-
-        df = df.dropna(
-            subset=["latitude", "longitude", "acq_date"]
-        )
     else:
         if not data_path.exists():
             st.error(
                 "app_data.csv was not found. "
-                "Place it in the same folder as app.py."
+                "Place it in the same directory as app.py."
             )
             st.stop()
 
@@ -129,12 +149,16 @@ except Exception as e:
 
 
 # ==========================================
-# 4. DATA VALIDATION
+# 5. DATA VALIDATION
 # ==========================================
 
 required_columns = [
-    "latitude", "longitude", "acq_date",
-    "frp", "satellite", "sensor"
+    "latitude",
+    "longitude",
+    "acq_date",
+    "frp",
+    "satellite",
+    "sensor"
 ]
 
 missing_columns = [
@@ -157,17 +181,18 @@ if df.empty:
 
 
 # ==========================================
-# 5. SIDEBAR FILTERS
+# 6. SIDEBAR FILTERS
 # ==========================================
 
 st.sidebar.header("Data Filters")
 
-# Date filter
+# Date range
+
 min_date = df["acq_date"].min().date()
 max_date = df["acq_date"].max().date()
 
 date_range = st.sidebar.date_input(
-    "Acquisition Date",
+    "Acquisition Date Range",
     value=(min_date, max_date),
     min_value=min_date,
     max_value=max_date
@@ -179,7 +204,9 @@ else:
     start_date = date_range
     end_date = date_range
 
+
 # Satellite filter
+
 satellites = sorted(
     df["satellite"].dropna().astype(str).unique()
 )
@@ -190,7 +217,9 @@ selected_satellites = st.sidebar.multiselect(
     default=satellites
 )
 
+
 # Sensor filter
+
 sensors = sorted(
     df["sensor"].dropna().astype(str).unique()
 )
@@ -201,27 +230,37 @@ selected_sensors = st.sidebar.multiselect(
     default=sensors
 )
 
+
 # FRP filter
+
 valid_frp = df["frp"].dropna()
 
+frp_range = None
+
 if not valid_frp.empty:
+
     frp_min = float(valid_frp.min())
     frp_max = float(valid_frp.max())
 
     if frp_min < frp_max:
+
         frp_range = st.sidebar.slider(
             "Fire Radiative Power (MW)",
             min_value=frp_min,
             max_value=frp_max,
             value=(frp_min, frp_max)
         )
+
     else:
         frp_range = (frp_min, frp_max)
-else:
-    frp_range = None
+
 
 # Day/night filter
+
+selected_daynight = None
+
 if "daynight" in df.columns:
+
     daynight_options = sorted(
         df["daynight"].dropna().astype(str).unique()
     )
@@ -231,12 +270,10 @@ if "daynight" in df.columns:
         daynight_options,
         default=daynight_options
     )
-else:
-    selected_daynight = None
 
 
 # ==========================================
-# 6. APPLY FILTERS
+# 7. APPLY FILTERS
 # ==========================================
 
 filtered = df.copy()
@@ -259,13 +296,16 @@ filtered = filtered[
 ]
 
 if frp_range is not None:
+
     filtered = filtered[
         filtered["frp"].between(
-            frp_range[0], frp_range[1]
+            frp_range[0],
+            frp_range[1]
         )
     ]
 
 if selected_daynight is not None:
+
     filtered = filtered[
         filtered["daynight"].astype(str).isin(
             selected_daynight
@@ -274,14 +314,15 @@ if selected_daynight is not None:
 
 
 # ==========================================
-# 7. APPLICATION HEADER
+# 8. APPLICATION HEADER
 # ==========================================
 
 st.title("🔥 NASA FireWatch")
 
 st.markdown(
     '<p class="subtitle">'
-    'Global wildfire hotspot monitoring using NASA MODIS and VIIRS satellite data'
+    'Global wildfire hotspot monitoring using '
+    'NASA MODIS and VIIRS satellite data'
     '</p>',
     unsafe_allow_html=True
 )
@@ -289,16 +330,99 @@ st.markdown(
 st.divider()
 
 if filtered.empty:
+
     st.warning(
         "No observations match your selected filters. "
         "Try adjusting the filters in the sidebar."
     )
+
     st.stop()
 
 
 # ==========================================
-# 8. KEY STATISTICS
+# 9. DATE PLAYBACK
 # ==========================================
+
+st.subheader("📅 Explore Hotspots Over Time")
+
+st.caption(
+    "Move through the timeline to explore how "
+    "satellite hotspot detections change over time."
+)
+
+available_dates = sorted(
+    filtered["acq_date"]
+    .dt.date
+    .dropna()
+    .unique()
+    .tolist()
+)
+
+if not available_dates:
+
+    st.warning("No valid acquisition dates available.")
+    st.stop()
+
+
+selected_date = st.select_slider(
+    "Move through the timeline",
+    options=available_dates,
+    value=available_dates[-1],
+    format_func=lambda d: d.strftime("%B %d, %Y")
+)
+
+
+# Observations for selected date
+
+selected_day = filtered[
+    filtered["acq_date"].dt.date == selected_date
+].copy()
+
+
+# Daily statistics
+
+daily_hotspots = len(selected_day)
+
+daily_average_frp = selected_day["frp"].mean()
+
+daily_max_frp = selected_day["frp"].max()
+
+
+# Display daily metrics
+
+st.markdown(
+    f"### Activity on {selected_date.strftime('%B %d, %Y')}"
+)
+
+c1, c2, c3 = st.columns(3)
+
+c1.metric(
+    "Daily Hotspots",
+    f"{daily_hotspots:,}"
+)
+
+c2.metric(
+    "Average FRP",
+    f"{daily_average_frp:.2f} MW"
+    if pd.notna(daily_average_frp)
+    else "N/A"
+)
+
+c3.metric(
+    "Maximum FRP",
+    f"{daily_max_frp:.2f} MW"
+    if pd.notna(daily_max_frp)
+    else "N/A"
+)
+
+st.divider()
+
+
+# ==========================================
+# 10. OVERALL STATISTICS
+# ==========================================
+
+st.subheader("📊 Overall Statistics")
 
 total_hotspots = len(filtered)
 
@@ -318,13 +442,15 @@ col1.metric(
 col2.metric(
     "Average FRP",
     f"{average_frp:.2f} MW"
-    if pd.notna(average_frp) else "N/A"
+    if pd.notna(average_frp)
+    else "N/A"
 )
 
 col3.metric(
     "Maximum FRP",
     f"{maximum_frp:.2f} MW"
-    if pd.notna(maximum_frp) else "N/A"
+    if pd.notna(maximum_frp)
+    else "N/A"
 )
 
 col4.metric(
@@ -336,7 +462,7 @@ st.divider()
 
 
 # ==========================================
-# 9. INTERACTIVE HOTSPOT MAP
+# 11. INTERACTIVE HOTSPOT MAP
 # ==========================================
 
 st.subheader("🌍 Global Hotspot Distribution")
@@ -346,41 +472,52 @@ st.caption(
     "Larger and brighter points represent higher FRP."
 )
 
-map_data = filtered.dropna(
+# IMPORTANT:
+# The map now uses selected_day instead of filtered.
+# This connects the date slider to the map.
+
+map_data = selected_day.dropna(
     subset=["latitude", "longitude"]
 ).copy()
 
-# Limit the number of rendered points for performance
+
+# Limit rendered points for performance
+
 MAX_MAP_POINTS = 50000
 
 if len(map_data) > MAX_MAP_POINTS:
+
     map_data = map_data.sample(
-        MAX_MAP_POINTS,
+        n=MAX_MAP_POINTS,
         random_state=42
     )
 
+
+# Prepare visualization values
+
 map_data["frp_display"] = (
-    map_data["frp"].fillna(0).clip(lower=0)
+    map_data["frp"]
+    .fillna(0)
+    .clip(lower=0)
 )
 
-# Radius scaling for visualization
 map_data["radius"] = (
     30 + map_data["frp_display"].clip(upper=100) * 2
 )
 
-# Color intensity
 map_data["intensity"] = (
     120 + map_data["frp_display"].clip(upper=100) * 1.3
 ).clip(upper=255)
+
+
+# Create map layer
 
 layer = pdk.Layer(
     "ScatterplotLayer",
     data=map_data,
     get_position="[longitude, latitude]",
     get_radius="radius",
-    get_fill_color="""
-        [255, intensity, 20, 190]
-    """,
+    get_fill_color="[255, intensity, 20, 190]",
     pickable=True,
     opacity=0.8,
     stroked=False,
@@ -388,12 +525,18 @@ layer = pdk.Layer(
     radius_max_pixels=12
 )
 
+
+# Global map view
+
 view_state = pdk.ViewState(
     latitude=20,
     longitude=0,
     zoom=1.2,
     pitch=0
 )
+
+
+# Map tooltip
 
 tooltip = {
     "html": """
@@ -409,6 +552,7 @@ tooltip = {
         "color": "white"
     }
 }
+
 
 deck = pdk.Deck(
     layers=[layer],
@@ -428,12 +572,13 @@ st.pydeck_chart(
 
 st.caption(
     f"Displaying {len(map_data):,} of "
-    f"{len(filtered):,} filtered observations."
+    f"{len(selected_day):,} observations for "
+    f"{selected_date.strftime('%B %d, %Y')}."
 )
 
 
 # ==========================================
-# 10. DAILY HOTSPOT ACTIVITY
+# 12. DAILY HOTSPOT ACTIVITY
 # ==========================================
 
 st.divider()
@@ -475,7 +620,7 @@ st.plotly_chart(
 
 
 # ==========================================
-# 11. MODIS VS VIIRS COMPARISON
+# 13. MODIS VS VIIRS COMPARISON
 # ==========================================
 
 st.divider()
@@ -493,7 +638,8 @@ with col1:
     )
 
     sensor_counts.columns = [
-        "Sensor", "Hotspots"
+        "Sensor",
+        "Hotspots"
     ]
 
     fig_sensor = px.pie(
@@ -509,6 +655,7 @@ with col1:
         fig_sensor,
         use_container_width=True
     )
+
 
 with col2:
 
@@ -537,7 +684,7 @@ with col2:
 
 
 # ==========================================
-# 12. DAY VS NIGHT ANALYSIS
+# 14. DAY VS NIGHT ANALYSIS
 # ==========================================
 
 if "daynight" in filtered.columns:
@@ -553,7 +700,8 @@ if "daynight" in filtered.columns:
     )
 
     daynight_data.columns = [
-        "Period", "Hotspots"
+        "Period",
+        "Hotspots"
     ]
 
     fig_daynight = px.bar(
@@ -572,7 +720,7 @@ if "daynight" in filtered.columns:
 
 
 # ==========================================
-# 13. RAW DATA EXPLORER
+# 15. HOTSPOT DATA EXPLORER
 # ==========================================
 
 st.divider()
@@ -580,7 +728,7 @@ st.divider()
 st.subheader("📋 Hotspot Data Explorer")
 
 st.caption(
-    "Explore the observations matching your current filters."
+    "Explore observations matching your current filters."
 )
 
 st.dataframe(
@@ -589,7 +737,12 @@ st.dataframe(
     hide_index=True
 )
 
-csv_data = filtered.to_csv(index=False).encode("utf-8")
+
+# Download filtered data
+
+csv_data = filtered.to_csv(
+    index=False
+).encode("utf-8")
 
 st.download_button(
     label="Download Filtered Dataset",
@@ -600,7 +753,7 @@ st.download_button(
 
 
 # ==========================================
-# 14. FOOTER
+# 16. FOOTER
 # ==========================================
 
 st.divider()
