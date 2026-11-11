@@ -278,10 +278,22 @@ if "daynight" in df.columns:
 
 filtered = df.copy()
 
+
+# Ensure acquisition dates use pandas datetime format
+filtered["acq_date"] = pd.to_datetime(
+    filtered["acq_date"], errors="coerce"
+)
+
+# Convert selected dates to pandas timestamps
+start_date = pd.Timestamp(start_date).normalize()
+end_date = pd.Timestamp(end_date).normalize()
+
+# Filter the selected date range (including the entire end date)
 filtered = filtered[
-    (filtered["acq_date"].dt.date >= start_date)
-    & (filtered["acq_date"].dt.date <= end_date)
-]
+    (filtered["acq_date"] >= start_date) &
+    (filtered["acq_date"] < end_date + pd.Timedelta(days=1))
+].copy()
+
 
 filtered = filtered[
     filtered["satellite"].astype(str).isin(
