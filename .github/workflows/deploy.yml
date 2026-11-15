@@ -1,0 +1,238 @@
+# Blue-green deploy of EmberScope to Cloud Run.
+#
+# Push to main builds the Dockerfile in Cloud Build, pushes the image to
+# Artifact Registry tagged with the commit SHA, and starts a Cloud Run revision
+# that receives no traffic. The workflow then requests /_stcore/health and /
+# on that revision's preview URL. Traffic moves only when both return 200.
+# A failed check leaves the previous revision in place.
+#
+# Run the workflow by hand and pass a revision name to send 100% of traffic
+# back to that revision.
+#
+# If GCP_PROJECT_ID, GCP_WORKLOAD_IDENTITY_PROVIDER, or GCP_SERVICE_ACCOUNT
+# is empty, the workflow logs a skip and exits successfully.
+
+name: Deploy EmberScope
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      revision:
+        description: "Revision that should receive 100% of traffic (rollback), for example emberscope-rabc12341"
+        required: true
+        type: string
+
+concurrency:
+  group: emberscope-cloud-run
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  preflight:
+    name: Check Google Cloud settings
+    runs-on: ubuntu-latest
+    outputs:
+      configured: ${{ steps.guard.outputs.configured }}
+    steps:
+      - name: Skip cleanly when repository variables are missing
+        id: guard
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+        run: |
+          set -eu
+          missing=""
+          [ -z "$GCP_PROJECT_ID" ] && missing="$missing GCP_PROJECT_ID"
+          [ -z "$GCP_WORKLOAD_IDENTITY_PROVIDER" ] && missing="$missing GCP_WORKLOAD_IDENTITY_PROVIDER"
+          [ -z "$GCP_SERVICE_ACCOUNT" ] && missing="$missing GCP_SERVICE_ACCOUNT"
+          if [ -n "$missing" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping Cloud Run deploy. Set repository variables:$missing"
+            exit 0
+          fi
+          echo "configured=true" >> "$GITHUB_OUTPUT"
+          echo "Cloud Run settings are present. Service name is emberscope."
+
+  deploy:
+    name: Blue-green deploy emberscope
+    needs: preflight
+    if: github.event_name == 'push' && needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Build image, smoke-test the new revision, then shift traffic
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          SECRET: ${{ vars.FIRMS_SECRET_NAME }}
+          SHA: ${{ github.sha }}
+          ATTEMPT: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          REGION="${REGION:-us-central1}"
+          SECRET="${SECRET:-FIRMS_MAP_KEY}"
+          SERVICE="emberscope"
+          SHORT="${SHA::7}"
+          TAG="r${SHORT}${ATTEMPT}"
+          IMAGE="${REGION}-docker.pkg.dev/${PROJECT}/emberscope/emberscope:${SHA}"
+
+          echo "Image: ${IMAGE}"
+          echo "Preview tag: ${TAG}"
+
+          if ! gcloud artifacts repositories describe emberscope --location "$REGION" --project "$PROJECT" >/dev/null 2>&1; then
+            gcloud artifacts repositories create emberscope \
+              --repository-format=docker \
+              --location "$REGION" \
+              --project "$PROJECT" \
+              --description "EmberScope images"
+          fi
+
+          gcloud builds submit --tag "$IMAGE" --project "$PROJECT" --timeout=20m .
+
+          FIRST=false
+          if ! gcloud run services describe "$SERVICE" --region "$REGION" --project "$PROJECT" >/dev/null 2>&1; then
+            FIRST=true
+            echo "First revision of emberscope. Cloud Run requires it to receive traffic while it is created."
+          fi
+
+          deploy_args=(
+            gcloud run deploy "$SERVICE"
+            --image "$IMAGE"
+            --project "$PROJECT"
+            --region "$REGION"
+            --platform managed
+            --memory 1Gi
+            --max-instances 2
+            --tag "$TAG"
+            --revision-suffix "$TAG"
+            --allow-unauthenticated
+            --quiet
+            --set-secrets "FIRMS_MAP_KEY=${SECRET}:latest"
+          )
+          if [ "$FIRST" = "false" ]; then
+            deploy_args+=(--no-traffic)
+            echo "Deploying ${TAG} with 0% traffic. The current revision keeps visitors."
+          fi
+          "${deploy_args[@]}"
+
+          REVISION=$(gcloud run services describe "$SERVICE" \
+            --region "$REGION" --project "$PROJECT" \
+            --format="value(status.latestCreatedRevisionName)")
+          echo "Created revision ${REVISION}"
+
+          gcloud run services describe "$SERVICE" \
+            --region "$REGION" --project "$PROJECT" --format=json > /tmp/emberscope-service.json
+          URL=$(TAG="$TAG" python3 -c 'import json,os; data=json.load(open("/tmp/emberscope-service.json")); tag=os.environ["TAG"]; urls=[item.get("url") for item in data.get("status",{}).get("traffic",[]) if item.get("tag")==tag and item.get("url")]; print(urls[0] if urls else data.get("status",{}).get("url",""))')
+
+          if [ -z "${URL}" ]; then
+            echo "No preview URL for tag ${TAG}. Traffic was not changed."
+            exit 1
+          fi
+          echo "Smoke-testing ${URL}"
+
+          smoke() {
+            target="${1%/}"
+            attempt=1
+            while [ "$attempt" -le 18 ]; do
+              health=$(curl -sS -L --max-time 20 -o /tmp/emberscope-health -w "%{http_code}" "${target}/_stcore/health" || true)
+              page=$(curl -sS -L --max-time 30 -o /tmp/emberscope-page -w "%{http_code}" "${target}/" || true)
+              echo "Attempt ${attempt}: /_stcore/health=${health:-000} /=${page:-000}"
+              if [ "$health" = "200" ] && [ "$page" = "200" ]; then
+                return 0
+              fi
+              attempt=$((attempt + 1))
+              sleep 10
+            done
+            return 1
+          }
+
+          if ! smoke "$URL"; then
+            if [ "$FIRST" = "true" ]; then
+              echo "Smoke test failed on the first revision. Deleting the new service so it is not left online."
+              gcloud run services delete "$SERVICE" --region "$REGION" --project "$PROJECT" --quiet
+            else
+              echo "Smoke test failed. Traffic stays on the previous revision."
+              echo "The new revision ${REVISION} is still available at ${URL} for inspection."
+            fi
+            exit 1
+          fi
+
+          if [ "$FIRST" = "false" ]; then
+            echo "Smoke test passed. Sending 100% of traffic to ${REVISION}."
+            gcloud run services update-traffic "$SERVICE" \
+              --region "$REGION" \
+              --project "$PROJECT" \
+              --to-revisions "${REVISION}=100"
+          else
+            echo "Smoke test passed. The first revision is already serving traffic."
+          fi
+
+          MAIN=$(gcloud run services describe "$SERVICE" \
+            --region "$REGION" --project "$PROJECT" --format="value(status.url)")
+          echo "emberscope is serving ${REVISION}"
+          echo "Service URL: ${MAIN}"
+
+  rollback:
+    name: Roll traffic back
+    needs: preflight
+    if: github.event_name == 'workflow_dispatch' && needs.preflight.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+
+      - name: Set up gcloud
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
+
+      - name: Send 100% of traffic to the chosen revision
+        env:
+          PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          REGION: ${{ vars.GCP_REGION }}
+          REVISION: ${{ inputs.revision }}
+        run: |
+          set -euo pipefail
+          REGION="${REGION:-us-central1}"
+          SERVICE="emberscope"
+          REVISION=$(printf '%s' "$REVISION" | tr -d '[:space:]')
+          if ! printf '%s' "$REVISION" | grep -Eq '^[a-z][a-z0-9-]{0,62}$'; then
+            echo "Revision names look like emberscope-rabc12341."
+            echo "List them with: gcloud run revisions list --service emberscope --region ${REGION}"
+            exit 1
+          fi
+          if ! gcloud run revisions describe "$REVISION" \
+            --region "$REGION" --project "$PROJECT" >/dev/null 2>&1; then
+            echo "No revision named ${REVISION} in ${REGION}."
+            echo "List them with: gcloud run revisions list --service ${SERVICE} --region ${REGION} --project ${PROJECT}"
+            exit 1
+          fi
+          gcloud run services update-traffic "$SERVICE" \
+            --region "$REGION" \
+            --project "$PROJECT" \
+            --to-revisions "${REVISION}=100"
+          echo "100% of traffic now goes to ${REVISION}."
