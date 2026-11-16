@@ -14,7 +14,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY app.py harmonize.py app_data.csv ./
+# Copy every app module. A named list missed archive.py and the image crashed
+# with ModuleNotFoundError on Cloud Run.
+COPY *.py app_data.csv ./
 COPY .streamlit/ .streamlit/
 
 EXPOSE 8080
