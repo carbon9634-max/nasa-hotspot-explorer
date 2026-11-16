@@ -15,10 +15,12 @@ The daily grid is the harmonized layer: ``MODIS n + VIIRS n / k``.
 
 from __future__ import annotations
 
+import json
 import os
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import pyarrow as pa
 import pyarrow.dataset as ds
@@ -91,11 +93,15 @@ def should_load_points(
     end: date,
     bbox: tuple[float, float, float, float] | None,
 ) -> bool:
-    """Points are allowed for about a month, or any length inside a small box."""
+    """Points load for about a month, or whenever a rectangle is selected.
+
+    A drawn box is the user's region, including a country-sized one. Only a
+    long range with no box stays on the daily grid alone.
+    """
 
     if inclusive_days(start, end) <= POINT_DAY_LIMIT:
         return True
-    return region_is_small(bbox)
+    return not bbox_is_world(bbox)
 
 
 def _filesystem(kind: str):
@@ -151,13 +157,22 @@ def _sources(sources: list[str] | None) -> list[str] | None:
     return cleaned or None
 
 
+def _month_clause(schema: pa.Schema, year: int, month: int):
+    year_match = _compare("year", year, schema)
+    month_type = schema.field("month").type
+    if pa.types.is_string(month_type) or pa.types.is_large_string(month_type):
+        # Hive folders are month=8 or month=08 depending on who wrote them.
+        return year_match & ds.field("month").isin([str(month), f"{month:02d}"])
+    return year_match & _compare("month", month, schema)
+
+
 def _month_filter(schema: pa.Schema, start: date, end: date):
     if "year" not in schema.names or "month" not in schema.names:
         return None
     clauses = []
     year, month = start.year, start.month
     while (year, month) <= (end.year, end.month):
-        clauses.append(_compare("year", year, schema) & _compare("month", month, schema))
+        clauses.append(_month_clause(schema, year, month))
         month += 1
         if month == 13:
             month = 1
@@ -169,12 +184,23 @@ def _month_filter(schema: pa.Schema, start: date, end: date):
 
 
 def _date_filter(schema: pa.Schema, column: str, start: date, end: date):
+    """Match date32 and timestamp columns. Both show up in the archive."""
+
     field_type = schema.field(column).type
+    col = ds.field(column)
     if pa.types.is_date(field_type):
-        return (ds.field(column) >= start) & (ds.field(column) <= end)
-    return (ds.field(column) >= pd.Timestamp(start)) & (
-        ds.field(column) < pd.Timestamp(end) + pd.Timedelta(days=1)
-    )
+        return (col >= pa.scalar(start, type=field_type)) & (col <= pa.scalar(end, type=field_type))
+    if pa.types.is_timestamp(field_type):
+        start_ts = pd.Timestamp(start)
+        end_excl = pd.Timestamp(end) + pd.Timedelta(days=1)
+        tz = getattr(field_type, "tz", None)
+        if tz:
+            start_ts = start_ts.tz_localize(tz)
+            end_excl = end_excl.tz_localize(tz)
+        return (col >= pa.scalar(start_ts.to_pydatetime(), type=field_type)) & (
+            col < pa.scalar(end_excl.to_pydatetime(), type=field_type)
+        )
+    return (col >= start.isoformat()) & (col <= end.isoformat())
 
 
 def _bbox_filter(schema: pa.Schema, lat_name: str, lon_name: str, bbox, cell: float = 0.0):
@@ -298,6 +324,26 @@ def _points_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["lat", "lon", "date"]).reset_index(drop=True)
 
 
+def _accumulate(dataset: ds.Dataset, filt, keys: list[str]) -> pd.DataFrame:
+    columns = [column for column in list(dict.fromkeys([*keys, "n", "frp_sum"])) if column in dataset.schema.names]
+    group_keys = [key for key in keys if key in columns]
+    acc = None
+    for batch in dataset.scanner(filter=filt, columns=columns).to_batches():
+        part = batch.to_pandas()
+        if part.empty:
+            continue
+        grouped = part.groupby(group_keys, as_index=False, dropna=False).agg(
+            n=("n", "sum"), frp_sum=("frp_sum", "sum")
+        )
+        acc = grouped if acc is None else pd.concat([acc, grouped], ignore_index=True)
+        acc = acc.groupby(group_keys, as_index=False, dropna=False).agg(
+            n=("n", "sum"), frp_sum=("frp_sum", "sum")
+        )
+    if acc is None:
+        return pd.DataFrame(columns=[*group_keys, "n", "frp_sum"])
+    return acc
+
+
 def load_daily_grid(
     kind: str,
     location: str,
@@ -321,21 +367,110 @@ def load_daily_grid(
         ds.field("source").isin(_sources(sources)) if _sources(sources) and "source" in schema.names else None,
         _bbox_filter(schema, "lat_bin", "lon_bin", bbox, cell=0.25),
     )
-    columns = [column for column in ("acq_date", "lat_bin", "lon_bin", "source", "n", "frp_sum") if column in schema.names]
     keys = ["lat_bin", "lon_bin", "source"] + (["acq_date"] if by_day else [])
-    acc = None
-    for batch in dataset.scanner(filter=filt, columns=columns).to_batches():
-        part = batch.to_pandas()
-        if part.empty:
-            continue
-        grouped = part.groupby(keys, as_index=False, dropna=False).agg(
-            n=("n", "sum"), frp_sum=("frp_sum", "sum")
-        )
-        acc = grouped if acc is None else pd.concat([acc, grouped], ignore_index=True)
-        acc = acc.groupby(keys, as_index=False, dropna=False).agg(n=("n", "sum"), frp_sum=("frp_sum", "sum"))
-    if acc is None:
-        acc = pd.DataFrame(columns=keys + ["n", "frp_sum"])
+    acc = _accumulate(dataset, filt, keys)
     return _grid_frame(acc, by_day, start_d), by_day
+
+
+def load_daily_totals(
+    kind: str,
+    location: str,
+    start,
+    end,
+    sources: list[str] | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
+) -> pd.DataFrame:
+    """One row per day per sensor inside the box. Small enough for a 10-year chart."""
+
+    start_d, end_d = _as_date(start), _as_date(end)
+    dataset = open_grid(kind, location)
+    schema = dataset.schema
+    filt = _combine(
+        _date_filter(schema, "acq_date", start_d, end_d),
+        ds.field("source").isin(_sources(sources)) if _sources(sources) and "source" in schema.names else None,
+        _bbox_filter(schema, "lat_bin", "lon_bin", bbox, cell=0.25),
+    )
+    acc = _accumulate(dataset, filt, ["acq_date", "source"])
+    if acc.empty:
+        return pd.DataFrame(columns=["date", "sensor", "source", "n_hotspots", "frp_sum"])
+    out = acc.copy()
+    out["date"] = pd.to_datetime(out["acq_date"])
+    out["source"] = out["source"].astype(str).str.lower()
+    out["sensor"] = out["source"].map(SENSOR_FROM_SOURCE).fillna(out["source"].str.upper())
+    out["n_hotspots"] = pd.to_numeric(out["n"], errors="coerce").fillna(0)
+    out["frp_sum"] = pd.to_numeric(out["frp_sum"], errors="coerce")
+    return out[["date", "sensor", "source", "n_hotspots", "frp_sum"]].reset_index(drop=True)
+
+
+def _vegetation_points(points: pd.DataFrame) -> pd.DataFrame:
+    if points is None or points.empty:
+        return points.iloc[0:0] if points is not None else pd.DataFrame()
+    work = points.copy()
+    if "conf_class" in work.columns:
+        work = work[work["conf_class"].astype(str).str.lower().isin(["nominal", "high"])]
+    if "type" in work.columns:
+        fire_type = pd.to_numeric(work["type"], errors="coerce")
+        work = work[fire_type.isna() | fire_type.eq(0)]
+    return work
+
+
+def cells_from_points(points: pd.DataFrame) -> pd.DataFrame:
+    """0.25° counts from detections when daily_grid does not cover the dates.
+
+    Keeps nominal and high confidence and vegetation fires (type 0 or missing).
+    """
+
+    empty = pd.DataFrame(columns=["date", "cell_lat", "cell_lon", "sensor", "n_hotspots", "frp_sum"])
+    work = _vegetation_points(points)
+    if work is None or work.empty:
+        return empty
+    work = work.copy()
+    work["cell_lat"] = (np.floor(work["lat"] / 0.25) * 0.25 + 0.125).round(4)
+    work["cell_lon"] = (np.floor(work["lon"] / 0.25) * 0.25 + 0.125).round(4)
+    work["date"] = pd.to_datetime(work["date"]).dt.floor("D")
+    return (
+        work.groupby(["date", "cell_lat", "cell_lon", "sensor"], as_index=False)
+        .agg(n_hotspots=("lat", "size"), frp_sum=("frp", "sum"))
+        .reset_index(drop=True)
+    )
+
+
+def daily_from_cells(cells: pd.DataFrame) -> pd.DataFrame:
+    columns = ["date", "sensor", "n_hotspots", "frp_sum"]
+    if cells is None or cells.empty:
+        return pd.DataFrame(columns=columns)
+    out = (
+        cells.groupby(["date", "sensor"], as_index=False)
+        .agg(n_hotspots=("n_hotspots", "sum"), frp_sum=("frp_sum", "sum"))
+    )
+    out["date"] = pd.to_datetime(out["date"])
+    return out
+
+
+def burn_calendar(daily: pd.DataFrame, k: float) -> pd.DataFrame:
+    """Year by month of MODIS n + VIIRS n / k. Columns are months 1–12."""
+
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=list(range(1, 13)))
+    work = daily.copy()
+    work["date"] = pd.to_datetime(work["date"])
+    work["year"] = work["date"].dt.year
+    work["month"] = work["date"].dt.month
+    modis = (
+        work.loc[work["sensor"].eq("MODIS")]
+        .groupby(["year", "month"])["n_hotspots"]
+        .sum()
+    )
+    viirs = (
+        work.loc[work["sensor"].eq("VIIRS")]
+        .groupby(["year", "month"])["n_hotspots"]
+        .sum()
+    )
+    harmonized = modis.add(viirs / k if k else 0, fill_value=0)
+    if harmonized.empty:
+        return pd.DataFrame(columns=list(range(1, 13)))
+    table = harmonized.unstack("month")
+    return table.reindex(columns=list(range(1, 13)))
 
 
 def _grid_frame(frame: pd.DataFrame, by_day: bool, start: date) -> pd.DataFrame:
@@ -391,11 +526,100 @@ def harmonize_archive_grid(grid: pd.DataFrame, k: float) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def default_archive_dates(today: date | None = None) -> tuple[date, date, date]:
-    """Return ``(min_date, default_start, default_end)`` with the last 7 days."""
+def default_archive_dates(today: date | None = None, coverage_end: date | None = None) -> tuple[date, date, date]:
+    """Return ``(min_date, default_start, default_end)`` with the last 7 available days."""
 
-    end = today or date.today()
+    today = today or date.today()
+    end = today if coverage_end is None else min(today, coverage_end)
+    if end < ARCHIVE_START:
+        end = ARCHIVE_START
     start = end - timedelta(days=6)
     if start < ARCHIVE_START:
         start = ARCHIVE_START
     return ARCHIVE_START, start, end
+
+
+def _parse_day(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value).strip()[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def normalize_manifest(data: dict | None) -> dict:
+    """Pick coverage dates out of a loosely shaped manifest.json."""
+
+    if not isinstance(data, dict):
+        return {}
+    nested = {}
+    for key in ("aggregate", "agg", "daily_grid", "points", "detections"):
+        block = data.get(key)
+        if isinstance(block, dict):
+            nested[key] = block
+
+    def pick(*keys):
+        for key in keys:
+            if key in data:
+                found = _parse_day(data.get(key))
+                if found:
+                    return found
+        return None
+
+    def from_block(block, *keys):
+        if not isinstance(block, dict):
+            return None
+        for key in keys:
+            found = _parse_day(block.get(key))
+            if found:
+                return found
+        return None
+
+    agg_start = pick("agg_start", "aggregate_start", "daily_grid_start") or from_block(
+        nested.get("aggregate") or nested.get("agg") or nested.get("daily_grid"), "start", "min", "min_date"
+    )
+    agg_end = pick("agg_end", "aggregate_end", "daily_grid_end") or from_block(
+        nested.get("aggregate") or nested.get("agg") or nested.get("daily_grid"), "end", "max", "max_date"
+    )
+    points_start = pick("points_start", "detections_start") or from_block(
+        nested.get("points") or nested.get("detections"), "start", "min", "min_date"
+    )
+    points_end = pick("points_end", "detections_end") or from_block(
+        nested.get("points") or nested.get("detections"), "end", "max", "max_date"
+    )
+    latest_candidates = [day for day in (agg_end, points_end) if day is not None]
+    return {
+        "agg_start": agg_start,
+        "agg_end": agg_end,
+        "points_start": points_start,
+        "points_end": points_end,
+        "latest": max(latest_candidates) if latest_candidates else None,
+    }
+
+
+def load_manifest(kind: str, location: str) -> dict:
+    """Read ``manifest.json`` next to the archive. Missing file means unknown coverage."""
+
+    try:
+        if kind == "local":
+            path = Path(location) / "manifest.json"
+            if not path.exists():
+                return {}
+            data = json.loads(path.read_text())
+        else:
+            import gcsfs
+
+            fs = gcsfs.GCSFileSystem()
+            object_name = f"{location.strip('/')}/manifest.json"
+            if not fs.exists(object_name):
+                return {}
+            data = json.loads(fs.cat(object_name))
+    except Exception:
+        return {}
+    return normalize_manifest(data)

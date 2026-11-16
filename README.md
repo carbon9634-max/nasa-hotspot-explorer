@@ -72,7 +72,7 @@ firms/source=viirs/year=YYYY/month=MM/part-*.parquet
 agg/daily_grid.parquet
 ```
 
-Point columns include `latitude`, `longitude`, `acq_date`, `acq_time` (HHMM), `satellite`, `instrument`, `confidence` (`low` / `nominal` / `high`), `frp`, `brightness`, `daynight`, `type`, and `source`. The daily grid columns are `acq_date`, `lat_bin`, `lon_bin` (0.25° lower-left), `source`, `n`, and `frp_sum`. `n` is nominal+high and type 0 or null, before the 1 km dedupe. Reads go through PyArrow datasets and, on GCS, `gcsfs` with Application Default Credentials. Results are cached for 10 minutes.
+Point columns include `latitude`, `longitude`, `acq_date`, `acq_time` (HHMM), `satellite`, `instrument`, `confidence` (`low` / `nominal` / `high`), `frp`, `brightness`, `daynight`, `type`, and `source`. The daily grid columns are `acq_date`, `lat_bin`, `lon_bin` (0.25° lower-left), `source`, `n`, and `frp_sum`. `n` is nominal+high and type 0 or null, before the 1 km dedupe. Optional `manifest.json` in the bucket root tells the app what is loaded, for example `{"agg_start":"2016-11-15","agg_end":"2025-12-31","points_start":"2016-11-15","points_end":"2026-11-15"}`. Dates the grid does not cover are counted from detections. Reads go through PyArrow datasets and, on GCS, `gcsfs` with Application Default Credentials. Results are cached for 10 minutes.
 
 A long range is summed to one row per cell so a decade does not land in memory as every day. Point reads stop after 250,000 rows. If the bucket cannot be read, the page says so. Unset `DATA_BUCKET` to return to `app_data.csv`.
 

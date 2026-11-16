@@ -2,8 +2,10 @@
 
 import os
 import unittest
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
+
+import pandas as pd
 from tempfile import TemporaryDirectory
 
 import pyarrow as pa
@@ -11,9 +13,13 @@ import pyarrow.parquet as pq
 
 from archive import (
     archive_location,
+    burn_calendar,
+    cells_from_points,
     harmonize_archive_grid,
     load_daily_grid,
+    load_daily_totals,
     load_points,
+    normalize_manifest,
     should_load_points,
 )
 
@@ -109,6 +115,10 @@ class ArchiveTests(unittest.TestCase):
         self.assertTrue(
             should_load_points(date(2016, 11, 15), date(2026, 11, 15), (10, 20, 20, 30))
         )
+        # A country-sized rectangle, not only a 20° box, should load points.
+        self.assertTrue(
+            should_load_points(date(2016, 11, 15), date(2026, 11, 15), (-20, 5, -80, -45))
+        )
         with TemporaryDirectory() as tmp:
             _write_archive(Path(tmp))
             grid, by_day = load_daily_grid(
@@ -120,6 +130,76 @@ class ArchiveTests(unittest.TestCase):
         self.assertFalse(by_day)
         self.assertEqual(len(grid), 3)
         self.assertEqual(int(grid.loc[grid["sensor"].eq("MODIS"), "n_hotspots"].sum()), 17)
+
+
+def _amazon_grid(dates, date_type):
+    return pa.table(
+        {
+            "acq_date": pa.array(dates, date_type),
+            "lat_bin": pa.array([-10.0, -10.0, 40.0], pa.float32()),
+            "lon_bin": pa.array([-60.0, -60.0, 10.0], pa.float32()),
+            "source": ["modis", "viirs", "modis"],
+            "n": pa.array([8, 4, 99], pa.int32()),
+            "frp_sum": pa.array([12.0, 6.0, 1.0], pa.float32()),
+        }
+    )
+
+
+class AmazonGridTests(unittest.TestCase):
+    def test_date32_and_timestamp_amazon_box(self):
+        amazon = (-15.0, -5.0, -70.0, -50.0)
+        for date_type in (pa.date32(), pa.timestamp("ns")):
+            with TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / "agg").mkdir()
+                values = [date(2024, 8, 15), date(2024, 8, 15), date(2024, 8, 16)]
+                if pa.types.is_timestamp(date_type):
+                    values = [datetime(2024, 8, 15), datetime(2024, 8, 15), datetime(2024, 8, 16)]
+                pq.write_table(_amazon_grid(values, date_type), root / "agg" / "daily_grid.parquet")
+                grid, by_day = load_daily_grid(
+                    "local",
+                    tmp,
+                    date(2024, 8, 1),
+                    date(2024, 8, 31),
+                    sources=["modis", "viirs"],
+                    bbox=amazon,
+                )
+                totals = load_daily_totals(
+                    "local",
+                    tmp,
+                    date(2024, 8, 1),
+                    date(2024, 8, 31),
+                    bbox=amazon,
+                )
+            self.assertTrue(by_day, date_type)
+            self.assertEqual(len(grid), 2, date_type)
+            self.assertEqual(int(grid["n_hotspots"].sum()), 12, date_type)
+            self.assertEqual(len(totals), 2, date_type)
+            calendar = burn_calendar(totals, k=4)
+            self.assertEqual(float(calendar.loc[2024, 8]), 8 + 4 / 4)
+
+    def test_points_fill_dates_the_aggregate_does_not_cover(self):
+        points = pd.DataFrame(
+            {
+                "lat": [ -9.9, -9.8, -9.7],
+                "lon": [-59.9, -59.8, -59.7],
+                "date": pd.to_datetime(["2026-11-10", "2026-11-10", "2026-11-11"]),
+                "sensor": ["MODIS", "VIIRS", "VIIRS"],
+                "conf_class": ["high", "nominal", "low"],
+                "type": [0, None, 0],
+                "frp": [10.0, 5.0, 1.0],
+            }
+        )
+        cells = cells_from_points(points)
+        self.assertEqual(len(cells), 2)
+        harmonized = harmonize_archive_grid(cells, k=5)
+        self.assertEqual(len(harmonized), 1)
+        self.assertAlmostEqual(float(harmonized.iloc[0]["harmonized"]), 1.2)
+        manifest = normalize_manifest(
+            {"agg_start": "2016-11-15", "agg_end": "2025-12-31", "points_end": "2026-11-15"}
+        )
+        self.assertEqual(manifest["agg_end"], date(2025, 12, 31))
+        self.assertEqual(manifest["latest"], date(2026, 11, 15))
 
 
 if __name__ == "__main__":

@@ -15,8 +15,13 @@ from archive import (
     archive_location,
     bbox_is_world,
     default_archive_dates,
+    burn_calendar,
+    cells_from_points,
+    daily_from_cells,
     harmonize_archive_grid,
     load_daily_grid,
+    load_daily_totals,
+    load_manifest,
     load_points,
     should_load_points,
 )
@@ -519,13 +524,198 @@ def cached_archive_points(kind: str, location: str, start_iso: str, end_iso: str
     )
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_archive_totals(kind: str, location: str, start_iso: str, end_iso: str, sources: tuple, bbox: tuple):
+    return load_daily_totals(
+        kind,
+        location,
+        date.fromisoformat(start_iso),
+        date.fromisoformat(end_iso),
+        list(sources),
+        bbox,
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_manifest(kind: str, location: str):
+    return load_manifest(kind, location)
+
+
+def render_selection_charts(daily: pd.DataFrame, cells: pd.DataFrame, points, k: float) -> None:
+    """Charts for the current dates, sensors, and rectangle."""
+
+    st.subheader("This selection")
+    if daily is not None and not daily.empty:
+        work = daily.copy()
+        work["date"] = pd.to_datetime(work["date"])
+        modis = work.loc[work["sensor"].eq("MODIS")].groupby("date")["n_hotspots"].sum()
+        viirs = work.loc[work["sensor"].eq("VIIRS")].groupby("date")["n_hotspots"].sum()
+        daily_chart = pd.DataFrame({"MODIS": modis, "VIIRS": viirs}).fillna(0)
+        daily_chart["VIIRS ÷ k"] = daily_chart["VIIRS"] / k if k else 0
+        daily_chart["Harmonized"] = daily_chart["MODIS"] + daily_chart["VIIRS ÷ k"]
+        melted = daily_chart.reset_index().melt(id_vars="date", var_name="Series", value_name="Hotspots")
+        fig_daily = px.line(
+            melted,
+            x="date",
+            y="Hotspots",
+            color="Series",
+            markers=True,
+            title="Hotspots per day",
+            template="plotly_dark",
+            color_discrete_map={
+                "MODIS": MODIS_COLOR,
+                "VIIRS": VIIRS_COLOR,
+                "VIIRS ÷ k": ADJUSTED_COLOR,
+                "Harmonized": "#F0E442",
+            },
+        )
+        st.plotly_chart(style_chart(fig_daily), width="stretch", theme=None)
+        monthly = daily_chart.copy()
+        monthly.index = pd.to_datetime(monthly.index)
+        monthly["month"] = monthly.index.to_period("M").to_timestamp()
+        month_totals = monthly.groupby("month")[["MODIS", "VIIRS", "Harmonized"]].sum().reset_index()
+        fig_month = px.line(
+            month_totals,
+            x="month",
+            y=["MODIS", "VIIRS", "Harmonized"],
+            markers=True,
+            title="Hotspots per month",
+            template="plotly_dark",
+            color_discrete_map={"MODIS": MODIS_COLOR, "VIIRS": VIIRS_COLOR, "Harmonized": "#F0E442"},
+        )
+        st.plotly_chart(style_chart(fig_month), width="stretch", theme=None)
+        st.caption(
+            f"Average {daily_chart['Harmonized'].mean():,.1f} harmonized hotspots per day "
+            f"in this selection. Total {daily_chart['Harmonized'].sum():,.0f}."
+        )
+        calendar = burn_calendar(work, k)
+        if not calendar.empty and calendar.to_numpy().sum() > 0:
+            fig_cal = px.imshow(
+                calendar.fillna(0).to_numpy(),
+                x=["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"],
+                y=[str(year) for year in calendar.index],
+                color_continuous_scale="Viridis",
+                aspect="auto",
+                labels=dict(color="Harmonized hotspots", x="Month", y="Year"),
+                title="Burn calendar",
+            )
+            st.plotly_chart(style_chart(fig_cal), width="stretch", theme=None)
+            st.caption("Each cell is that month's MODIS count plus VIIRS count divided by k, inside the rectangle.")
+
+    left, right = st.columns(2)
+    with left:
+        if daily is not None and not daily.empty:
+            share = daily.groupby("sensor")["n_hotspots"].sum().reset_index()
+            fig_pie = px.pie(
+                share,
+                names="sensor",
+                values="n_hotspots",
+                hole=0.45,
+                title="MODIS and VIIRS share",
+                template="plotly_dark",
+                color="sensor",
+                color_discrete_map=SENSOR_COLOR_MAP,
+            )
+            st.plotly_chart(style_chart(fig_pie), width="stretch", theme=None)
+    with right:
+        if daily is not None and not daily.empty:
+            modis_n = float(daily.loc[daily["sensor"].eq("MODIS"), "n_hotspots"].sum())
+            viirs_n = float(daily.loc[daily["sensor"].eq("VIIRS"), "n_hotspots"].sum())
+            comparison = pd.DataFrame(
+                {
+                    "Series": ["MODIS", "VIIRS raw", "VIIRS ÷ k"],
+                    "Hotspots": [modis_n, viirs_n, viirs_n / k if k else 0],
+                }
+            )
+            fig_bar = px.bar(
+                comparison,
+                x="Series",
+                y="Hotspots",
+                title="Raw counts and VIIRS on the MODIS scale",
+                template="plotly_dark",
+                color="Series",
+                color_discrete_map=SENSOR_COLOR_MAP,
+            )
+            st.plotly_chart(style_chart(fig_bar), width="stretch", theme=None)
+
+    if cells is not None and not cells.empty and {"cell_lat", "cell_lon", "harmonized"}.issubset(cells.columns):
+        ranked = cells.groupby(["cell_lat", "cell_lon"], as_index=False)["harmonized"].sum()
+        top = ranked.nlargest(min(10, len(ranked)), "harmonized")
+        top["Cell"] = top.apply(lambda row: f"{row['cell_lat']:.2f}, {row['cell_lon']:.2f}", axis=1)
+        fig_top = px.bar(
+            top,
+            x="harmonized",
+            y="Cell",
+            orientation="h",
+            title="Top cells",
+            template="plotly_dark",
+            color_discrete_sequence=["#009E73"],
+        )
+        st.plotly_chart(style_chart(fig_top), width="stretch", theme=None)
+
+    if points is None or points.empty:
+        return
+    st.caption("The next three charts use individual detections in this rectangle and date range.")
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_frp = px.histogram(
+            points,
+            x="frp",
+            color="sensor",
+            nbins=40,
+            title="FRP distribution",
+            template="plotly_dark",
+            color_discrete_map=SENSOR_COLOR_MAP,
+        )
+        st.plotly_chart(style_chart(fig_frp), width="stretch", theme=None)
+    with c2:
+        conf = points["conf_class"].astype(str).value_counts().reset_index()
+        conf.columns = ["Confidence", "Detections"]
+        fig_conf = px.bar(
+            conf,
+            x="Confidence",
+            y="Detections",
+            title="Confidence",
+            template="plotly_dark",
+            color="Confidence",
+            color_discrete_sequence=["#0072B2", "#E69F00", "#009E73", "#F0E442"],
+        )
+        st.plotly_chart(style_chart(fig_conf), width="stretch", theme=None)
+    if "daynight" in points.columns:
+        period = points["daynight"].map(daynight_label).value_counts().reset_index()
+        period.columns = ["Period", "Detections"]
+        fig_period = px.bar(
+            period,
+            x="Period",
+            y="Detections",
+            color="Period",
+            title="Day and night",
+            template="plotly_dark",
+            color_discrete_map={"Day": MODIS_COLOR, "Night": VIIRS_COLOR},
+        )
+        st.plotly_chart(style_chart(fig_period), width="stretch", theme=None)
+
+
 def render_archive() -> None:
     """10-year GCS (or local DATA_PATH) archive. Does not load the bundled CSV."""
 
     kind, location = archive_location()
-    archive_min, default_start, default_end = default_archive_dates(date.today())
+    manifest = cached_manifest(kind, location) or {}
+    archive_min, default_start, default_end = default_archive_dates(date.today(), manifest.get("latest"))
     where = f"gs://{location}" if kind == "gcs" else location
     st.sidebar.caption(f"Archive: {where}")
+    if manifest.get("agg_end") or manifest.get("points_end"):
+        agg_bit = (
+            f"grid {manifest['agg_start']}–{manifest['agg_end']}"
+            if manifest.get("agg_end")
+            else "grid coverage unknown"
+        )
+        points_bit = (
+            f"points {manifest['points_start']}–{manifest['points_end']}"
+            if manifest.get("points_end")
+            else "points coverage unknown"
+        )
+        st.sidebar.caption(f"Coverage: {agg_bit}; {points_bit}.")
     picked = st.sidebar.date_input(
         "Acquisition date range",
         value=(default_start, default_end),
@@ -547,16 +737,26 @@ def render_archive() -> None:
     )
     bbox = region_controls()
     source_names = tuple(name.lower() for name in sensors) or ("modis", "viirs")
+    # Recomputed every run from the dates and rectangle on screen. Not stored.
     load_points_now = should_load_points(start_date, end_date, bbox)
+    bbox_key = tuple(float(value) for value in bbox)
     try:
         with st.spinner("Reading the fire archive…"):
-            grid, by_day = cached_archive_grid(
+            grid, _by_day = cached_archive_grid(
                 kind,
                 location,
                 start_date.isoformat(),
                 end_date.isoformat(),
                 source_names,
-                tuple(float(v) for v in bbox),
+                bbox_key,
+            )
+            daily = cached_archive_totals(
+                kind,
+                location,
+                start_date.isoformat(),
+                end_date.isoformat(),
+                source_names,
+                bbox_key,
             )
             points, truncated = (None, False)
             if load_points_now:
@@ -566,7 +766,7 @@ def render_archive() -> None:
                     start_date.isoformat(),
                     end_date.isoformat(),
                     source_names,
-                    tuple(float(v) for v in bbox),
+                    bbox_key,
                 )
     except Exception as exc:
         st.error("The archive could not be read, so the map was not drawn.")
@@ -600,8 +800,25 @@ def render_archive() -> None:
         )
         points = points[points["daynight"].astype(str).isin(chosen_periods)]
 
+    built_from_points = False
+    if points is not None:
+        built = cells_from_points(points)
+        agg_end = manifest.get("agg_end")
+        grid_missing = grid is None or grid.empty
+        agg_stops_early = agg_end is not None and end_date > agg_end
+        if grid_missing and built is not None and not built.empty:
+            grid = built
+            daily = daily_from_cells(built)
+            built_from_points = True
+        elif agg_stops_early and built is not None and not built.empty:
+            extra = built[pd.to_datetime(built["date"]).dt.date > agg_end]
+            if not extra.empty:
+                grid = pd.concat([grid, extra], ignore_index=True) if not grid_missing else extra
+                extra_daily = daily_from_cells(extra)
+                daily = extra_daily if daily is None or daily.empty else pd.concat([daily, extra_daily], ignore_index=True)
+                built_from_points = True
     harmonized = harmonize_archive_grid(grid, k_value)
-    if frp_range is not None and points is None and not harmonized.empty:
+    if frp_range is not None and points is None and harmonized is not None and not harmonized.empty:
         harmonized = harmonized[harmonized["frp_sum"].between(frp_range[0], frp_range[1])]
 
     st.title("EmberScope")
@@ -610,14 +827,30 @@ def render_archive() -> None:
         unsafe_allow_html=True,
     )
     st.caption(f"Archive {start_date.isoformat()} to {end_date.isoformat()}. k = {k_value:.3f}.")
+    if manifest.get("latest") and default_end < date.today() and end_date >= default_end:
+        st.caption(f"Loaded data runs through {manifest['latest']}. Later days are not in the archive yet.")
+    # This condition is the current rectangle, not a message saved from an earlier draw.
     if not load_points_now:
         st.info(
-            "This date range is long and the region is large, so individual detections stay in storage. "
-            "The map uses the 0.25° daily grid (MODIS count + VIIRS count / k). "
-            "Narrow the dates to 31 days, or drag a smaller box, to load points."
+            "This date range is long and no rectangle is selected, so individual detections stay in storage. "
+            "Charts use the 0.25° daily grid. Drag a rectangle to load detections for that region."
         )
     elif truncated:
         st.info("This query was capped so the app stays up. Draw a smaller region to see a tighter set of detections.")
+    if built_from_points:
+        covered = manifest.get("agg_end")
+        if covered:
+            st.info(
+                f"The daily grid currently ends {covered}. "
+                "Harmonized cells for the later dates were counted from detections "
+                "(nominal and high confidence, type 0 or missing)."
+            )
+        else:
+            st.info(
+                "The daily grid has no rows for these dates. "
+                "Harmonized cells were counted from detections "
+                "(nominal and high confidence, type 0 or missing)."
+            )
 
     view = st.radio(
         "Map view",
@@ -722,6 +955,7 @@ def render_archive() -> None:
         )
         st.plotly_chart(style_chart(fig_bar), width="stretch", theme=None)
         st.caption("VIIRS ÷ k is the MODIS-equivalent count. The harmonized map adds that to the MODIS count.")
+    render_selection_charts(daily, harmonized, points, k_value)
 
 
 def load_saved_copy() -> pd.DataFrame:
