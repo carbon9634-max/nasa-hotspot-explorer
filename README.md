@@ -8,9 +8,15 @@ The science lives in `harmonize.py`. It follows `Submission_Project.ipynb`, whic
 
 ## What the map shows
 
-**Raw detections.** One point per satellite pixel that passes the sidebar filters. VIIRS confidence letters (`l`, `n`, `h`) and MODIS scores (`0`–`100`) both become **low**, **nominal**, or **high**. Low is below 30, nominal is 30–79, high is 80–100. The map opens on the whole world. Scroll to zoom and drag to pan. Higher fire radiative power (FRP) is drawn larger as you zoom in.
+The basemap is CARTO Voyager, a light street map. No Mapbox token. Scroll and the +/- buttons zoom.
 
-**Harmonized 0.25° grid.** Hotspots are counted in cells about 28 km on a side. From 1 February 2012 onward, a day that has VIIRS uses **VIIRS ÷ k**. MODIS is not added on top of the same day, so a fire is not counted twice. A day with no VIIRS (the sample's last few days are like this) shows unscaled MODIS and says so. Color runs from yellow (fewer) to red (more) on a log scale.
+**Raw detections.** One point per satellite pixel. MODIS is blue (`#0072B2`) and VIIRS is orange (`#E69F00`), the Okabe-Ito pair. Hover or click a point for latitude, longitude, date and time in UTC, satellite, instrument, confidence, FRP, brightness, and day or night.
+
+**Harmonized 0.25° grid.** Cells are colored with viridis (fewer to more). On the bundled sample, a day with VIIRS uses **VIIRS ÷ k**, and a day with only MODIS shows the MODIS count. On the 10-year archive, each cell is **MODIS n + VIIRS n / k**. FRP is summed and is not divided by k.
+
+Drag a rectangle on the street map under the legend to limit the region, or type south/north/west/east in the sidebar. **Clear region** removes the box. The FRP slider is one range. Its ends stay at the min and max for the current dates and sensors, so lowering the max does not trap the handle.
+
+**Archive dates.** With `DATA_BUCKET` or `DATA_PATH` set, the date control runs from 15 November 2016 through today and opens on the last 7 days. Individual points load when that range is 31 days or less, or when the box is smaller than about 20° on a side. Wider requests use the daily grid only. The map draws at most 50,000 points and says when it sampled.
 
 The sidebar date range chooses which days are included. The slider under the title chooses which one day the map draws. Satellite, sensor, confidence, FRP, and day/night filters apply before the grid is built.
 
@@ -40,13 +46,48 @@ On the bundled sample, after steps 3 and 4, that ratio is **73,334 / 14,129 = 5.
 
 ```text
 Browser
-  └─ Streamlit (app.py) + pydeck map
-       ├─ harmonize.py          normalize, aggregate, k, 2012-02-01 splice
-       ├─ app_data.csv          bundled sample, used when nothing else is set
-       ├─ EMBER_DATA_URI        optional CSV or Parquet, including gs://
-       └─ FIRMS area API        VIIRS_SNPP_NRT and MODIS_NRT, world, 1 day
-            cached 10 minutes, needs FIRMS_MAP_KEY
+  └─ Streamlit (app.py)
+       ├─ pydeck + CARTO Voyager     fire points and the grid
+       ├─ folium Draw                rectangle region filter
+       ├─ harmonize.py               bundled sample and live NRT
+       ├─ archive.py                 10-year parquet in GCS or a local folder
+       ├─ app_data.csv               used only when DATA_BUCKET and DATA_PATH are unset
+       └─ FIRMS area API             Live (last 24h), needs FIRMS_MAP_KEY
 ```
+
+## Archive in Cloud Storage
+
+Set one of these. `DATA_PATH` wins when both are set, which is how the tests run.
+
+```bash
+export DATA_BUCKET="emberscope-data-156735151789"   # Cloud Run
+export DATA_PATH="/path/to/local-archive"           # laptop or tests; file:// is accepted
+```
+
+Expected layout:
+
+```text
+firms/source=modis/year=YYYY/month=MM/part-*.parquet
+firms/source=viirs/year=YYYY/month=MM/part-*.parquet
+agg/daily_grid.parquet
+```
+
+Point columns include `latitude`, `longitude`, `acq_date`, `acq_time` (HHMM), `satellite`, `instrument`, `confidence` (`low` / `nominal` / `high`), `frp`, `brightness`, `daynight`, `type`, and `source`. The daily grid columns are `acq_date`, `lat_bin`, `lon_bin` (0.25° lower-left), `source`, `n`, and `frp_sum`. `n` is nominal+high and type 0 or null, before the 1 km dedupe. Reads go through PyArrow datasets and, on GCS, `gcsfs` with Application Default Credentials. Results are cached for 10 minutes.
+
+A long range is summed to one row per cell so a decade does not land in memory as every day. Point reads stop after 250,000 rows. If the bucket cannot be read, the page says so. Unset `DATA_BUCKET` to return to `app_data.csv`.
+
+Cloud Run needs more memory once the archive is attached. Update the live service before the demo:
+
+```bash
+gcloud run services update emberscope \
+  --region us-central1 \
+  --memory 4Gi \
+  --cpu 2 \
+  --timeout 300 \
+  --update-env-vars DATA_BUCKET=emberscope-data-156735151789
+```
+
+The runtime service account needs `roles/storage.objectViewer` on that bucket. 1 GiB is enough for the bundled sample and is tight for a month of global points.
 
 Cloud Run runs the container defined by the `Dockerfile`. Google Cloud Build builds that image. You do not install Docker on a laptop to deploy.
 
@@ -77,7 +118,9 @@ Optional environment variables:
 ```bash
 export FIRMS_MAP_KEY="your-firms-map-key"   # enables Live (last 24h)
 export HARMONIZE_K="5.19"                   # optional override of k
-export EMBER_DATA_URI="gs://bucket/fires.parquet"  # optional, else app_data.csv
+export DATA_BUCKET="emberscope-data-156735151789"  # 10-year archive
+export DATA_PATH="/path/to/local-archive"   # optional local stand-in for the bucket
+export EMBER_DATA_URI="gs://bucket/one-file.parquet"  # optional single file, bundled mode only
 ```
 
 `EMBER_DATA_URI` may be a local `.csv` or `.parquet`, or a `gs://` path. A detection file has `latitude` / `longitude`. A grid file has `sensor`, `date`, `cell_lat`, `cell_lon`, and `n_hotspots` (the output of `aggregate`). A `gs://` read uses Application Default Credentials. If the read fails, the app shows a message and uses `app_data.csv`.
@@ -157,7 +200,7 @@ gcloud secrets add-iam-policy-binding FIRMS_MAP_KEY \
 
 ### Budget alert
 
-In the Google Cloud console open **Billing → Budgets & alerts → Create budget**. Scope it to this project. A small demo budget such as 20 USD is enough: the service below is capped at 2 instances and 1 GiB of memory. Set email alerts at 50%, 90%, and 100%, and send them to the team.
+In the Google Cloud console open **Billing → Budgets & alerts → Create budget**. Scope it to this project. A small demo budget such as 20 USD is enough: the service below is capped at 2 instances. With the archive attached, give the service 4 GiB and 2 CPUs. Set email alerts at 50%, 90%, and 100%, and send them to the team.
 
 ### Deploy
 
@@ -168,12 +211,13 @@ gcloud run deploy emberscope \
   --source . \
   --region "$REGION" \
   --allow-unauthenticated \
-  --memory 1Gi \
+  --memory 4Gi \
+  --cpu 2 \
   --max-instances 2 \
   --set-secrets FIRMS_MAP_KEY=FIRMS_MAP_KEY:latest
 ```
 
-`--memory 1Gi` gives Streamlit room for the fire table. `--max-instances 2` caps the bill if the public URL gets traffic. The container listens on the `PORT` Cloud Run sets (8080).
+`--memory 4Gi` and `--cpu 2` leave room for a month of points. `--max-instances 2` caps the bill. The container listens on the `PORT` Cloud Run sets (8080). The bundled sample alone fits in 1 GiB. Use 4 GiB when `DATA_BUCKET` is set.
 
 Open the service:
 
@@ -298,4 +342,6 @@ Push to `main` to deploy. To roll back, run the workflow manually and pass the r
 | `PORT` | Port Streamlit listens on. Cloud Run sets it. The image defaults to 8080. |
 | `FIRMS_MAP_KEY` | NASA FIRMS map key for Live mode. On Cloud Run this comes from Secret Manager. |
 | `HARMONIZE_K` | Optional positive number. Replaces the bundled k of 5.190318. |
-| `EMBER_DATA_URI` | Optional CSV or Parquet path, or `gs://bucket/object`. Falls back to `app_data.csv`. |
+| `DATA_BUCKET` | GCS bucket with `firms/` and `agg/daily_grid.parquet`. Unset uses `app_data.csv`. |
+| `DATA_PATH` | Local archive with the same layout. Overrides `DATA_BUCKET`. `file://` is accepted. |
+| `EMBER_DATA_URI` | Optional single CSV or Parquet, including `gs://`, for the bundled path. |

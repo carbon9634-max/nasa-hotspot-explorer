@@ -121,7 +121,8 @@ jobs:
             --project "$PROJECT"
             --region "$REGION"
             --platform managed
-            --memory 1Gi
+            --memory 4Gi
+            --cpu 2
             --max-instances 2
             --tag "$TAG"
             --revision-suffix "$TAG"

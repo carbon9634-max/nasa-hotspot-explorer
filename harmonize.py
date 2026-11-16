@@ -61,11 +61,13 @@ _HARMONIZED_COLUMNS = _GRID_COLUMNS + ["harmonized", "scale_note"]
 _DETECTION_COLUMNS = [
     "sensor",
     "satellite",
+    "instrument",
     "date",
     "hhmm",
     "lat",
     "lon",
     "frp",
+    "brightness",
     "daynight",
     "type",
     "confidence",
@@ -190,10 +192,19 @@ def normalize(df: pd.DataFrame, sensor: str) -> pd.DataFrame:
         }
     )
 
+    if "brightness" in work.columns:
+        brightness = pd.to_numeric(work["brightness"], errors="coerce")
+    elif "bright_ti4" in work.columns:
+        brightness = pd.to_numeric(work["bright_ti4"], errors="coerce")
+    else:
+        brightness = np.nan
+    instrument = work["instrument"] if "instrument" in work.columns else ""
+
     out = pd.DataFrame(
         {
             "sensor": sensor,
             "satellite": work["satellite"] if "satellite" in work.columns else "",
+            "instrument": instrument,
             "date": pd.to_datetime(work["acq_date"], errors="coerce"),
             "hhmm": hhmm,
             "lat": pd.to_numeric(work["latitude"], errors="coerce"),
@@ -201,6 +212,7 @@ def normalize(df: pd.DataFrame, sensor: str) -> pd.DataFrame:
             "frp": pd.to_numeric(work["frp"], errors="coerce")
             if "frp" in work.columns
             else np.nan,
+            "brightness": brightness,
             "daynight": work["daynight"] if "daynight" in work.columns else "",
             "type": fire_type,
             "confidence": confidence,

@@ -2,6 +2,7 @@ import json
 import math
 import os
 import time
+from datetime import date, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -9,6 +10,16 @@ import plotly.express as px
 import pydeck as pdk
 import streamlit as st
 
+from archive import (
+    MAX_RENDER_POINTS,
+    archive_location,
+    bbox_is_world,
+    default_archive_dates,
+    harmonize_archive_grid,
+    load_daily_grid,
+    load_points,
+    should_load_points,
+)
 from harmonize import (
     DATA_URI_ENV,
     FIRMS_KEY_ENV,
@@ -23,16 +34,27 @@ from harmonize import (
     standardize_grid,
 )
 
-DATA_PATH = Path(__file__).parent / "app_data.csv"
-CARTO_DARK = "https://basemaps.cartocdn.com/gl/dark-matter-gl-style/style.json"
-MAX_MAP_POINTS = 50_000
+BUNDLED_CSV = Path(__file__).parent / "app_data.csv"
+CARTO_VOYAGER = "https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json"
+MAX_MAP_POINTS = MAX_RENDER_POINTS
 LIVE_RETRY_SECONDS = 120
-
-CONF_COLORS = {
-    "high": (239, 68, 68),
-    "nominal": (251, 146, 60),
-    "low": (148, 163, 184),
-    "unknown": (100, 116, 139),
+WORLD_BBOX = (-90.0, 90.0, -180.0, 180.0)
+MODIS_COLOR = "#0072B2"
+VIIRS_COLOR = "#E69F00"
+ADJUSTED_COLOR = "#009E73"
+SENSOR_RGB = {"MODIS": (0, 114, 178), "VIIRS": (230, 159, 0)}
+VIRIDIS_STOPS = (
+    (0.00, (68, 1, 84)),
+    (0.25, (59, 82, 139)),
+    (0.50, (33, 145, 140)),
+    (0.75, (94, 201, 98)),
+    (1.00, (253, 231, 37)),
+)
+SENSOR_COLOR_MAP = {
+    "MODIS": MODIS_COLOR,
+    "VIIRS": VIIRS_COLOR,
+    "VIIRS raw": VIIRS_COLOR,
+    "VIIRS ÷ k": ADJUSTED_COLOR,
 }
 
 
@@ -89,17 +111,19 @@ def as_records(frame: pd.DataFrame) -> list[dict]:
     return json.loads(payload.to_json(orient="records", double_precision=4))
 
 
-def attach_confidence_colors(frame: pd.DataFrame) -> pd.DataFrame:
-    colors = (
-        frame["conf_class"]
-        .fillna("unknown")
-        .astype(str)
-        .map(CONF_COLORS)
-        .apply(lambda item: item if isinstance(item, tuple) else CONF_COLORS["unknown"])
-    )
-    rgb = pd.DataFrame(
-        colors.tolist(), columns=["fill_r", "fill_g", "fill_b"], index=frame.index
-    )
+def viridis_rgb(tone: float) -> tuple[int, int, int]:
+    tone = min(1.0, max(0.0, float(tone)))
+    for (left, start), (right, end) in zip(VIRIDIS_STOPS, VIRIDIS_STOPS[1:]):
+        if tone <= right or right == 1:
+            span = right - left or 1
+            mix = (tone - left) / span
+            return tuple(int(start[i] + (end[i] - start[i]) * mix) for i in range(3))
+    return VIRIDIS_STOPS[-1][1]
+
+
+def attach_sensor_colors(frame: pd.DataFrame) -> pd.DataFrame:
+    colors = frame["sensor"].map(lambda sensor: SENSOR_RGB.get(str(sensor).upper(), (100, 100, 100)))
+    rgb = pd.DataFrame(colors.tolist(), columns=["fill_r", "fill_g", "fill_b"], index=frame.index)
     return pd.concat([frame, rgb], axis=1)
 
 
@@ -111,9 +135,10 @@ def attach_count_colors(frame: pd.DataFrame, column: str) -> pd.DataFrame:
     if not pd.notna(hi) or hi <= 0:
         hi = 1.0
     tone = (logged / hi).clip(0, 1)
-    out["fill_r"] = 255
-    out["fill_g"] = (210 - 170 * tone).round().astype(int)
-    out["fill_b"] = (50 - 30 * tone).round().astype(int)
+    rgb = [viridis_rgb(value) for value in tone]
+    out["fill_r"] = [item[0] for item in rgb]
+    out["fill_g"] = [item[1] for item in rgb]
+    out["fill_b"] = [item[2] for item in rgb]
     return out
 
 
@@ -127,58 +152,302 @@ def style_chart(fig):
     return fig
 
 
-def show_map(records: list[dict], tooltip: dict, radius_min: int, radius_max: int, map_key: str) -> None:
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=records,
-        get_position="[lon, lat]",
-        get_radius="radius",
-        get_fill_color="[fill_r, fill_g, fill_b, 210]",
-        pickable=True,
-        opacity=0.85,
-        stroked=False,
-        radius_min_pixels=radius_min,
-        radius_max_pixels=radius_max,
-        auto_highlight=True,
+def world_view() -> pdk.ViewState:
+    return pdk.ViewState(latitude=15, longitude=0, zoom=1.05, min_zoom=0.4, max_zoom=12, pitch=0, bearing=0)
+
+
+def view_for_bbox(bbox) -> pdk.ViewState:
+    if bbox_is_world(bbox):
+        return world_view()
+    south, north, west, east = bbox
+    span = max(north - south, east - west, 0.5)
+    zoom = max(0.5, min(10.0, math.log2(360 / span)))
+    return pdk.ViewState(
+        latitude=(south + north) / 2,
+        longitude=(west + east) / 2,
+        zoom=zoom,
+        min_zoom=0.4,
+        max_zoom=12,
+        pitch=0,
+        bearing=0,
+    )
+
+
+def show_map(records, tooltip, radius_min, radius_max, map_key, bbox=None, view_state=None):
+    layers = []
+    if bbox is not None and not bbox_is_world(bbox):
+        south, north, west, east = bbox
+        layers.append(
+            pdk.Layer(
+                "PolygonLayer",
+                data=[{"polygon": [[west, south], [east, south], [east, north], [west, north]]}],
+                get_polygon="polygon",
+                get_fill_color=[0, 114, 178, 28],
+                get_line_color=[0, 114, 178, 230],
+                line_width_min_pixels=2,
+                stroked=True,
+                filled=True,
+                pickable=False,
+            )
+        )
+    layers.append(
+        pdk.Layer(
+            "ScatterplotLayer",
+            data=records,
+            get_position="[lon, lat]",
+            get_radius="radius",
+            get_fill_color="[fill_r, fill_g, fill_b, 210]",
+            get_line_color=[30, 30, 30, 180],
+            pickable=True,
+            opacity=0.9,
+            stroked=True,
+            filled=True,
+            line_width_min_pixels=1,
+            radius_min_pixels=radius_min,
+            radius_max_pixels=radius_max,
+            auto_highlight=True,
+        )
     )
     deck = pdk.Deck(
-        layers=[layer],
-        initial_view_state=pdk.ViewState(
-            latitude=15,
-            longitude=0,
-            zoom=1.05,
-            min_zoom=0.4,
-            max_zoom=10,
-            pitch=0,
-            bearing=0,
-        ),
+        layers=layers,
+        initial_view_state=view_state or view_for_bbox(bbox),
         tooltip=tooltip,
-        map_style=CARTO_DARK,
+        map_provider="carto",
+        map_style=CARTO_VOYAGER,
     )
-    st.pydeck_chart(deck, width="stretch", height=560, on_select="ignore", key=map_key)
+    return st.pydeck_chart(
+        deck,
+        width="stretch",
+        height=560,
+        on_select="rerun",
+        selection_mode="single-object",
+        key=map_key,
+    )
 
 
 def legend_html(kind: str) -> str:
     swatch = (
         "display:inline-block;width:12px;height:12px;border-radius:99px;"
-        "margin-right:6px;vertical-align:-1px;"
+        "margin-right:6px;vertical-align:-1px;border:1px solid #0f172a;"
     )
-    if kind == "confidence":
+    if kind == "sensor":
         return f"""
         <div style="display:flex;gap:18px;flex-wrap:wrap;font-size:14px;color:#e2e8f0;">
-          <span><span style="{swatch}background:#ef4444;"></span>High confidence</span>
-          <span><span style="{swatch}background:#fb923c;"></span>Nominal confidence</span>
-          <span><span style="{swatch}background:#94a3b8;"></span>Low confidence</span>
+          <span><span style="{swatch}background:{MODIS_COLOR};"></span>MODIS</span>
+          <span><span style="{swatch}background:{VIIRS_COLOR};"></span>VIIRS</span>
+          <span>Okabe-Ito colors. Confidence, FRP, and time are in the tooltip.</span>
         </div>
         """
     return """
     <div style="display:flex;align-items:center;gap:10px;font-size:14px;color:#e2e8f0;">
       <span>Fewer</span>
-      <span style="display:inline-block;width:160px;height:12px;border-radius:99px;
-        background:linear-gradient(90deg,#ffe14a,#ff8a1e,#ff2d2d);"></span>
-      <span>More MODIS-equivalent hotspots</span>
+      <span style="display:inline-block;width:180px;height:12px;border-radius:99px;border:1px solid #0f172a;
+        background:linear-gradient(90deg,#440154,#3b528b,#21918c,#5ec962,#fde725);"></span>
+      <span>More MODIS-equivalent hotspots (viridis)</span>
     </div>
     """
+
+
+def clock_label(value) -> str:
+    text = str(value).split(".")[0].replace("<NA>", "").replace("nan", "")
+    if not text:
+        return ""
+    text = text.zfill(4)
+    if len(text) >= 4 and text[:4].isdigit():
+        return f"{text[:2]}:{text[2:4]}"
+    return ""
+
+
+def current_bbox():
+    return (
+        float(st.session_state.get("bbox_s", -90.0)),
+        float(st.session_state.get("bbox_n", 90.0)),
+        float(st.session_state.get("bbox_w", -180.0)),
+        float(st.session_state.get("bbox_e", 180.0)),
+    )
+
+
+def region_changed(new, old) -> bool:
+    return any(abs(float(a) - float(b)) > 0.05 for a, b in zip(new, old))
+
+
+def clear_region():
+    """Runs before widgets, so it may reset the number inputs."""
+
+    for key, value in zip(("bbox_s", "bbox_n", "bbox_w", "bbox_e"), WORLD_BBOX):
+        st.session_state[key] = value
+    st.session_state["draw_nonce"] = int(st.session_state.get("draw_nonce", 0)) + 1
+
+
+def region_controls():
+    """Numeric box, used when a drag-box is awkward. World means no filter."""
+
+    pending = st.session_state.pop("pending_bbox", None)
+    if pending:
+        st.session_state.bbox_s, st.session_state.bbox_n, st.session_state.bbox_w, st.session_state.bbox_e = pending
+    for key, value in zip(("bbox_s", "bbox_n", "bbox_w", "bbox_e"), WORLD_BBOX):
+        st.session_state.setdefault(key, value)
+    st.sidebar.subheader("Region")
+    st.sidebar.caption("Type a box, or drag a rectangle on the street map.")
+    st.sidebar.number_input("South latitude", min_value=-90.0, max_value=90.0, step=0.5, key="bbox_s")
+    st.sidebar.number_input("North latitude", min_value=-90.0, max_value=90.0, step=0.5, key="bbox_n")
+    st.sidebar.number_input("West longitude", min_value=-180.0, max_value=180.0, step=0.5, key="bbox_w")
+    st.sidebar.number_input("East longitude", min_value=-180.0, max_value=180.0, step=0.5, key="bbox_e")
+    st.sidebar.button("Clear region", on_click=clear_region)
+    south, north, west, east = current_bbox()
+    if south > north:
+        south, north = north, south
+    if west > east:
+        west, east = east, west
+    return (south, north, west, east)
+
+
+def draw_region_map(bbox):
+    """Folium rectangle draw. Pydeck in Streamlit cannot return a dragged box."""
+
+    import folium
+    from folium.plugins import Draw
+    from streamlit_folium import st_folium
+
+    south, north, west, east = bbox
+    center = [15, 0] if bbox_is_world(bbox) else [(south + north) / 2, (west + east) / 2]
+    zoom = 2 if bbox_is_world(bbox) else 4
+    fmap = folium.Map(location=center, zoom_start=zoom, tiles=None, scrollWheelZoom=True)
+    # CARTO's raster endpoint now returns "API key required" tiles.
+    # OpenStreetMap is the free street basemap for the draw box.
+    # The fire map below stays on the CARTO Voyager GL style.
+    folium.TileLayer(
+        tiles="https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        attr="&copy; OpenStreetMap contributors",
+        name="Streets",
+        max_zoom=19,
+    ).add_to(fmap)
+    if not bbox_is_world(bbox):
+        folium.Rectangle(
+            bounds=[[south, west], [north, east]],
+            color="#0072B2",
+            weight=2,
+            fill=False,
+        ).add_to(fmap)
+    Draw(
+        export=False,
+        draw_options={
+            "polyline": False,
+            "polygon": False,
+            "circle": False,
+            "marker": False,
+            "circlemarker": False,
+            "rectangle": True,
+        },
+        edit_options={"edit": False, "remove": False},
+    ).add_to(fmap)
+    st.caption(
+        "Drag a rectangle to filter. Scroll or use +/- to zoom. "
+        "Clear region in the sidebar removes the box."
+    )
+    output = st_folium(
+        fmap,
+        height=360,
+        use_container_width=True,
+        returned_objects=["last_active_drawing"],
+        key=f"region-draw-{st.session_state.get('draw_nonce', 0)}",
+    )
+    drawing = (output or {}).get("last_active_drawing") or {}
+    geometry = drawing.get("geometry") or {}
+    if geometry.get("type") != "Polygon":
+        return
+    ring = geometry.get("coordinates") or [[]]
+    ring = ring[0] if ring else []
+    if len(ring) < 4:
+        return
+    lons = [float(point[0]) for point in ring]
+    lats = [float(point[1]) for point in ring]
+    new = (min(lats), max(lats), min(lons), max(lons))
+    if region_changed(new, current_bbox()):
+        st.session_state["pending_bbox"] = new
+        st.rerun()
+
+
+def filter_bbox(frame: pd.DataFrame, bbox, lat_col: str, lon_col: str) -> pd.DataFrame:
+    if frame.empty or bbox_is_world(bbox) or lat_col not in frame.columns:
+        return frame
+    south, north, west, east = bbox
+    return frame[frame[lat_col].between(south, north) & frame[lon_col].between(west, east)]
+
+
+def frp_slider(series: pd.Series, key: str):
+    """Range slider whose ceiling stays at the unfiltered max for this key."""
+
+    valid = pd.to_numeric(series, errors="coerce").dropna()
+    if valid.empty or float(valid.min()) >= float(valid.max()):
+        return None
+    low = float(valid.min())
+    high = float(valid.max())
+    if key not in st.session_state:
+        st.session_state[key] = (low, high)
+    return st.sidebar.slider(
+        "Fire radiative power (MW)",
+        min_value=low,
+        max_value=high,
+        key=key,
+        help="Bounds are the min and max for this date range and sensor, before the other filters.",
+    )
+
+
+def point_tooltip_fields(frame: pd.DataFrame) -> pd.DataFrame:
+    out = frame.copy()
+    out["date_label"] = pd.to_datetime(out["date"]).dt.strftime("%Y-%m-%d")
+    out["time_label"] = out["hhmm"].map(clock_label) if "hhmm" in out.columns else ""
+    out["frp_label"] = pd.to_numeric(out["frp"], errors="coerce").round(1)
+    out["bright_label"] = (
+        pd.to_numeric(out["brightness"], errors="coerce").round(1) if "brightness" in out.columns else ""
+    )
+    out["conf_label"] = out["conf_class"].fillna(out.get("confidence", "")).astype(str)
+    out["sat_label"] = out["satellite"].fillna("").astype(str) if "satellite" in out.columns else ""
+    out["inst_label"] = out["instrument"].fillna("").astype(str) if "instrument" in out.columns else ""
+    out["when_label"] = out["daynight"].map(daynight_label) if "daynight" in out.columns else ""
+    out["lat_label"] = pd.to_numeric(out["lat"], errors="coerce").round(4)
+    out["lon_label"] = pd.to_numeric(out["lon"], errors="coerce").round(4)
+    return out
+
+
+POINT_TOOLTIP = {
+    "html": (
+        "<b>{lat_label}, {lon_label}</b><br/>"
+        "{date_label} {time_label} UTC<br/>"
+        "{sat_label} · {inst_label}<br/>"
+        "Confidence: {conf_label}<br/>"
+        "FRP: {frp_label} MW<br/>"
+        "Brightness: {bright_label}<br/>"
+        "{when_label}"
+    ),
+    "style": {"backgroundColor": "#172033", "color": "white", "fontSize": "13px"},
+}
+
+
+def describe_click(state) -> None:
+    selection = getattr(state, "selection", None) or {}
+    objects = selection.get("objects") if isinstance(selection, dict) else None
+    row = None
+    if isinstance(objects, dict):
+        for rows in objects.values():
+            if rows:
+                row = rows[0]
+                break
+    elif isinstance(objects, list) and objects:
+        row = objects[0]
+    if not isinstance(row, dict):
+        return
+    bits = [
+        f"{row.get('lat_label', row.get('lat', ''))}, {row.get('lon_label', row.get('lon', ''))}",
+        f"{row.get('date_label', '')} {row.get('time_label', '')} UTC".strip(),
+        f"{row.get('sat_label', row.get('satellite', ''))} · {row.get('inst_label', row.get('instrument', ''))}",
+        f"Confidence: {row.get('conf_label', '')}",
+        f"FRP: {row.get('frp_label', row.get('frp', ''))} MW",
+        f"Brightness: {row.get('bright_label', '')}",
+        str(row.get("when_label", "")),
+    ]
+    st.caption(" · ".join(bit for bit in bits if bit and bit != " · "))
 
 
 def daynight_label(value: str) -> str:
@@ -226,10 +495,239 @@ def cached_live_raw(map_key: str):
     return fetch_firms_nrt(map_key)
 
 
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_archive_grid(kind: str, location: str, start_iso: str, end_iso: str, sources: tuple, bbox: tuple):
+    return load_daily_grid(
+        kind,
+        location,
+        date.fromisoformat(start_iso),
+        date.fromisoformat(end_iso),
+        list(sources),
+        bbox,
+    )
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def cached_archive_points(kind: str, location: str, start_iso: str, end_iso: str, sources: tuple, bbox: tuple):
+    return load_points(
+        kind,
+        location,
+        date.fromisoformat(start_iso),
+        date.fromisoformat(end_iso),
+        list(sources),
+        bbox,
+    )
+
+
+def render_archive() -> None:
+    """10-year GCS (or local DATA_PATH) archive. Does not load the bundled CSV."""
+
+    kind, location = archive_location()
+    archive_min, default_start, default_end = default_archive_dates(date.today())
+    where = f"gs://{location}" if kind == "gcs" else location
+    st.sidebar.caption(f"Archive: {where}")
+    picked = st.sidebar.date_input(
+        "Acquisition date range",
+        value=(default_start, default_end),
+        min_value=archive_min,
+        max_value=date.today(),
+        key="archive-dates",
+        required=True,
+    )
+    start_date, end_date = parse_date_range(picked, default_start, default_end)
+    if start_date < archive_min:
+        start_date = archive_min
+    if end_date > date.today():
+        end_date = date.today()
+    sensors = st.sidebar.multiselect(
+        "Sensor",
+        ["MODIS", "VIIRS"],
+        default=["MODIS", "VIIRS"],
+        key="archive-sensor",
+    )
+    bbox = region_controls()
+    source_names = tuple(name.lower() for name in sensors) or ("modis", "viirs")
+    load_points_now = should_load_points(start_date, end_date, bbox)
+    try:
+        with st.spinner("Reading the fire archive…"):
+            grid, by_day = cached_archive_grid(
+                kind,
+                location,
+                start_date.isoformat(),
+                end_date.isoformat(),
+                source_names,
+                tuple(float(v) for v in bbox),
+            )
+            points, truncated = (None, False)
+            if load_points_now:
+                points, truncated = cached_archive_points(
+                    kind,
+                    location,
+                    start_date.isoformat(),
+                    end_date.isoformat(),
+                    source_names,
+                    tuple(float(v) for v in bbox),
+                )
+    except Exception as exc:
+        st.error("The archive could not be read, so the map was not drawn.")
+        st.caption(public_error(exc))
+        st.caption("Unset DATA_BUCKET to use the bundled sample, or check that the service account can read the bucket.")
+        return
+
+    frp_series = None
+    frp_key = f"frp-archive-{start_date}-{end_date}-{'-'.join(source_names)}"
+    if points is not None and "frp" in points.columns and not points.empty:
+        frp_series = points["frp"]
+    elif not grid.empty and "frp_sum" in grid.columns:
+        frp_series = grid["frp_sum"]
+    frp_range = frp_slider(frp_series, frp_key) if frp_series is not None else None
+    if frp_range is not None and points is not None:
+        points = points[points["frp"].between(frp_range[0], frp_range[1])]
+    if points is not None and not points.empty:
+        chosen_classes = st.sidebar.multiselect(
+            "Confidence class",
+            ["low", "nominal", "high"],
+            default=["low", "nominal", "high"],
+            key="archive-conf",
+        )
+        points = points[points["conf_class"].astype(str).isin(chosen_classes)]
+        chosen_periods = st.sidebar.multiselect(
+            "Day / Night",
+            ["D", "N"],
+            default=["D", "N"],
+            format_func=daynight_label,
+            key="archive-dn",
+        )
+        points = points[points["daynight"].astype(str).isin(chosen_periods)]
+
+    harmonized = harmonize_archive_grid(grid, k_value)
+    if frp_range is not None and points is None and not harmonized.empty:
+        harmonized = harmonized[harmonized["frp_sum"].between(frp_range[0], frp_range[1])]
+
+    st.title("EmberScope")
+    st.markdown(
+        '<p class="subtitle">Ten years of MODIS and VIIRS, harmonized onto the MODIS scale.</p>',
+        unsafe_allow_html=True,
+    )
+    st.caption(f"Archive {start_date.isoformat()} to {end_date.isoformat()}. k = {k_value:.3f}.")
+    if not load_points_now:
+        st.info(
+            "This date range is long and the region is large, so individual detections stay in storage. "
+            "The map uses the 0.25° daily grid (MODIS count + VIIRS count / k). "
+            "Narrow the dates to 31 days, or drag a smaller box, to load points."
+        )
+    elif truncated:
+        st.info("This query was capped so the app stays up. Draw a smaller region to see a tighter set of detections.")
+
+    view = st.radio(
+        "Map view",
+        ["Raw detections", "Harmonized grid"],
+        horizontal=True,
+        key="map_view",
+        width="stretch",
+    )
+    if view == "Raw detections" and points is not None:
+        st.markdown(legend_html("sensor"), unsafe_allow_html=True)
+    else:
+        st.markdown(
+            "Harmonized count in each cell is MODIS n + VIIRS n / k. "
+            "These archive counts are nominal and high confidence, before the 1 km dedupe."
+        )
+        st.markdown(legend_html("grid"), unsafe_allow_html=True)
+    draw_region_map(bbox)
+
+    if view == "Raw detections" and points is not None and not points.empty:
+        shown = points
+        sample_note = ""
+        if len(shown) > MAX_MAP_POINTS:
+            shown = shown.sample(MAX_MAP_POINTS, random_state=42)
+            sample_note = f" Showing a sample of {MAX_MAP_POINTS:,} of {len(points):,}."
+        shown = attach_sensor_colors(shown)
+        shown["radius"] = 4000 + shown["frp"].fillna(0).clip(lower=0, upper=200) * 150
+        shown = point_tooltip_fields(shown)
+        records = as_records(
+            shown[
+                [
+                    "lon",
+                    "lat",
+                    "radius",
+                    "fill_r",
+                    "fill_g",
+                    "fill_b",
+                    "lat_label",
+                    "lon_label",
+                    "date_label",
+                    "time_label",
+                    "sat_label",
+                    "inst_label",
+                    "conf_label",
+                    "frp_label",
+                    "bright_label",
+                    "when_label",
+                ]
+            ]
+        )
+        state = show_map(records, POINT_TOOLTIP, 2, 14, "archive-points", bbox=bbox)
+        describe_click(state)
+        st.caption(f"{len(points):,} detections in the query.{sample_note}")
+    elif not harmonized.empty:
+        drawn = harmonized.rename(columns={"cell_lon": "lon", "cell_lat": "lat"})
+        drawn = attach_count_colors(drawn, "harmonized")
+        drawn["radius"] = 12000
+        drawn["date_label"] = pd.to_datetime(drawn["date"]).dt.strftime("%Y-%m-%d")
+        drawn["harmonized_label"] = drawn["harmonized"].round(2)
+        drawn["frp_label"] = drawn["frp_sum"].round(1)
+        records = as_records(
+            drawn[
+                ["lon", "lat", "radius", "fill_r", "fill_g", "fill_b", "date_label", "harmonized_label", "frp_label"]
+            ]
+        )
+        show_map(
+            records,
+            {
+                "html": "{date_label}<br/>MODIS-equivalent hotspots: {harmonized_label}<br/>FRP sum: {frp_label} MW",
+                "style": {"backgroundColor": "#172033", "color": "white"},
+            },
+            3,
+            22,
+            "archive-grid",
+            bbox=bbox,
+        )
+        st.caption(f"{len(harmonized):,} grid cells. Harmonized = MODIS n + VIIRS n / {k_value:.3f}.")
+    else:
+        st.warning("No archive rows match these dates, sensors, and region.")
+
+    if not harmonized.empty:
+        totals = (
+            grid.groupby("sensor")["n_hotspots"].sum()
+            if not grid.empty
+            else pd.Series(dtype=float)
+        )
+        modis_n = float(totals.get("MODIS", 0) or 0)
+        viirs_n = float(totals.get("VIIRS", 0) or 0)
+        comparison = pd.DataFrame(
+            {
+                "Series": ["MODIS", "VIIRS raw", "VIIRS ÷ k"],
+                "Hotspots": [modis_n, viirs_n, viirs_n / k_value],
+            }
+        )
+        fig_bar = px.bar(
+            comparison,
+            x="Series",
+            y="Hotspots",
+            title="Archive counts in this filter",
+            template="plotly_dark",
+            color="Series",
+            color_discrete_map=SENSOR_COLOR_MAP,
+        )
+        st.plotly_chart(style_chart(fig_bar), width="stretch", theme=None)
+        st.caption("VIIRS ÷ k is the MODIS-equivalent count. The harmonized map adds that to the MODIS count.")
+
+
 def load_saved_copy() -> pd.DataFrame:
-    if not DATA_PATH.exists():
+    if not BUNDLED_CSV.exists():
         raise FileNotFoundError("app_data.csv was not found next to app.py.")
-    return load_bundled_detections(str(DATA_PATH)).copy()
+    return load_bundled_detections(str(BUNDLED_CSV)).copy()
 
 
 def load_live(map_key: str):
@@ -271,11 +769,16 @@ st.sidebar.title("EmberScope")
 st.sidebar.caption("MODIS and VIIRS on one scale")
 st.sidebar.caption(f"k = {k_value:.3f}. {k_source}.")
 
+saved_label = "Archive" if archive_location() else "Bundled sample"
 requested = st.sidebar.radio(
     "Data source",
-    ["Bundled sample", "Live (last 24h)", "Upload CSV"],
+    [saved_label, "Live (last 24h)", "Upload CSV"],
     help="Live loads the latest FIRMS day for VIIRS SNPP NRT and MODIS NRT, then caches it for 10 minutes.",
 )
+
+if requested == "Archive":
+    render_archive()
+    st.stop()
 
 messages: list[tuple[str, str]] = []
 mode = "detections"
@@ -422,15 +925,6 @@ if mode == "detections":
                 format_func=daynight_label,
                 key=f"dn-{token}",
             )
-    valid_frp = frame["frp"].dropna()
-    if not valid_frp.empty and float(valid_frp.min()) < float(valid_frp.max()):
-        frp_range = st.sidebar.slider(
-            "Fire radiative power (MW)",
-            min_value=float(valid_frp.min()),
-            max_value=float(valid_frp.max()),
-            value=(float(valid_frp.min()), float(valid_frp.max())),
-            key=f"frp-{token}-{float(valid_frp.min()):.4f}-{float(valid_frp.max()):.4f}",
-        )
 else:
     st.sidebar.caption(
         "This file is already a 0.25° grid, so satellite, confidence, day/night, and FRP filters are not available."
@@ -438,18 +932,26 @@ else:
 
 start_ts = pd.Timestamp(start_date).normalize()
 end_ts = pd.Timestamp(end_date).normalize() + pd.Timedelta(days=1)
-filtered = frame[frame["date"].notna()].copy()
-filtered = filtered[(filtered["date"] >= start_ts) & (filtered["date"] < end_ts)]
+bbox = region_controls()
+dated = frame[frame["date"].notna()].copy()
+dated = dated[(dated["date"] >= start_ts) & (dated["date"] < end_ts)]
 if selected_sensors is not None:
-    filtered = filtered[filtered["sensor"].astype(str).isin(selected_sensors)]
+    dated = dated[dated["sensor"].astype(str).isin(selected_sensors)]
+if mode == "detections" and "frp" in dated.columns:
+    frp_key = f"frp-{token}-{start_date}-{end_date}-{','.join(selected_sensors or [])}"
+    frp_range = frp_slider(dated["frp"], frp_key)
+filtered = dated
 if selected_satellites is not None:
     filtered = filtered[filtered["satellite"].astype(str).isin(selected_satellites)]
 if selected_classes is not None:
     filtered = filtered[filtered["conf_class"].fillna("unknown").astype(str).isin(selected_classes)]
 if selected_daynight is not None:
     filtered = filtered[filtered["daynight"].astype(str).isin(selected_daynight)]
-if frp_range is not None:
+if frp_range is not None and "frp" in filtered.columns:
     filtered = filtered[filtered["frp"].between(frp_range[0], frp_range[1])]
+lat_name = "lat" if "lat" in filtered.columns else "cell_lat"
+lon_name = "lon" if "lon" in filtered.columns else "cell_lon"
+filtered = filter_bbox(filtered, bbox, lat_name, lon_name)
 
 for level, text in messages:
     getattr(st, level)(text)
@@ -505,20 +1007,20 @@ view = st.radio(
 
 if view == "Raw detections":
     st.markdown(
-        "Each point is one satellite detection that passed the sidebar filters. "
-        "VIIRS confidence letters and MODIS numeric scores use the same three classes. "
-        "Scroll to zoom and drag to pan. The map opens on the whole world; "
-        "higher FRP is drawn larger as you zoom in."
+        "Each point is one satellite detection. Blue is MODIS and orange is VIIRS. "
+        "Hover or click a point for time, confidence, FRP, and brightness. "
+        "Scroll or use +/- to zoom."
     )
-    st.markdown(legend_html("confidence"), unsafe_allow_html=True)
+    st.markdown(legend_html("sensor"), unsafe_allow_html=True)
 else:
     st.markdown(
-        "Each circle is a 0.25° cell (about 28 km). The color is the MODIS-equivalent "
-        f"hotspot count: VIIRS detections divided by k = {k_value:.3f}. "
-        "Low-confidence detections stay in the raw view and are left out of this grid. "
-        "FRP is summed, not divided by k."
+        "Each circle is a 0.25° cell (about 28 km). Color is a viridis scale of the "
+        f"MODIS-equivalent hotspot count (VIIRS divided by k = {k_value:.3f}). "
+        "FRP in the tooltip is summed, not divided by k."
     )
     st.markdown(legend_html("grid"), unsafe_allow_html=True)
+
+draw_region_map(bbox)
 
 if filtered.empty:
     st.warning("Nothing matches these filters. Widen the date range or turn a filter back on.")
@@ -587,12 +1089,10 @@ if view == "Raw detections" and mode == "detections":
     if map_data.empty:
         st.info("This day has no detections to draw.")
     else:
-        map_data = attach_confidence_colors(map_data)
+        map_data = attach_sensor_colors(map_data)
         frp_display = map_data["frp"].fillna(0).clip(lower=0, upper=200)
         map_data["radius"] = 4000 + frp_display * 150
-        map_data["date_label"] = map_data["date"].dt.strftime("%Y-%m-%d")
-        map_data["frp_label"] = map_data["frp"].round(1).fillna(0)
-        map_data["conf_label"] = map_data["conf_class"].fillna("unknown")
+        map_data = point_tooltip_fields(map_data)
         records = as_records(
             map_data[
                 [
@@ -602,27 +1102,28 @@ if view == "Raw detections" and mode == "detections":
                     "fill_r",
                     "fill_g",
                     "fill_b",
-                    "satellite",
-                    "sensor",
+                    "lat_label",
+                    "lon_label",
                     "date_label",
+                    "time_label",
+                    "sat_label",
+                    "inst_label",
                     "conf_label",
                     "frp_label",
+                    "bright_label",
+                    "when_label",
                 ]
             ]
         )
-        show_map(
+        picked = show_map(
             records,
-            {
-                "html": (
-                    "<b>{satellite}</b> · {sensor}<br/>{date_label}<br/>"
-                    "Confidence: {conf_label}<br/>FRP: {frp_label} MW"
-                ),
-                "style": tooltip_style,
-            },
+            POINT_TOOLTIP,
             radius_min=2,
             radius_max=14,
             map_key="map-raw",
+            bbox=bbox,
         )
+        describe_click(picked)
         extra = ""
         if len(day_rows) > len(map_data):
             extra = f" Showing the {len(map_data):,} highest-FRP rows."
@@ -654,6 +1155,7 @@ elif view == "Raw detections":
             radius_min=3,
             radius_max=22,
             map_key="map-grid-raw",
+            bbox=bbox,
         )
         st.caption("These rows were already aggregated to 0.25° cells in the source file.")
 else:
@@ -703,6 +1205,7 @@ else:
             radius_min=3,
             radius_max=22,
             map_key="map-harmonized",
+            bbox=bbox,
         )
         st.caption(
             f"{len(day_cells):,} cells on {selected_date.strftime('%B %d, %Y')}. "
@@ -787,6 +1290,8 @@ with left:
             hole=0.45,
             title="Raw detections by sensor",
             template="plotly_dark",
+            color="Sensor",
+            color_discrete_map=SENSOR_COLOR_MAP,
         )
         st.plotly_chart(style_chart(fig_pie), width="stretch", theme=None)
         st.caption("Every row, including low confidence.")
@@ -800,6 +1305,8 @@ with left:
             hole=0.45,
             title="Hotspots by sensor",
             template="plotly_dark",
+            color="Sensor",
+            color_discrete_map=SENSOR_COLOR_MAP,
         )
         st.plotly_chart(style_chart(fig_pie), width="stretch", theme=None)
 with right:
@@ -820,7 +1327,7 @@ with right:
             title="1 km hotspots, nominal + high",
             template="plotly_dark",
             color="Series",
-            color_discrete_sequence=["#38bdf8", "#fb923c", "#f97316"],
+            color_discrete_map=SENSOR_COLOR_MAP,
         )
         st.plotly_chart(style_chart(fig_bar), width="stretch", theme=None)
         st.caption(
@@ -841,6 +1348,7 @@ if mode == "detections" and "daynight" in filtered.columns:
         color="Period",
         title="Detections by time of day",
         template="plotly_dark",
+        color_discrete_map={"Day": MODIS_COLOR, "Night": VIIRS_COLOR},
     )
     st.plotly_chart(style_chart(fig_period), width="stretch", theme=None)
 
