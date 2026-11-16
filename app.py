@@ -18,6 +18,9 @@ from archive import (
     burn_calendar,
     cells_from_points,
     daily_from_cells,
+    GRID_TOOLTIP_FIELDS,
+    GRID_TOOLTIP_HTML,
+    grid_tooltip_frame,
     harmonize_archive_grid,
     load_daily_grid,
     chart_date_window,
@@ -179,7 +182,40 @@ def view_for_bbox(bbox) -> pdk.ViewState:
     )
 
 
-def show_map(records, tooltip, radius_min, radius_max, map_key, bbox=None, view_state=None):
+def _scatter(records, radius_min, radius_max, pickable=True):
+    return pdk.Layer(
+        "ScatterplotLayer",
+        data=records,
+        get_position="[lon, lat]",
+        get_radius="radius",
+        get_fill_color="[fill_r, fill_g, fill_b, 210]",
+        get_line_color=[30, 30, 30, 180],
+        pickable=pickable,
+        opacity=0.9,
+        stroked=True,
+        filled=True,
+        line_width_min_pixels=1,
+        radius_min_pixels=radius_min,
+        radius_max_pixels=radius_max,
+        auto_highlight=True,
+    )
+
+
+def _grid_map_records(harmonized: pd.DataFrame, start, end, k: float) -> list[dict]:
+    """Scatter rows for the harmonized grid. Every tooltip placeholder is a column."""
+
+    tips = grid_tooltip_frame(harmonized, start, end, k)
+    if tips.empty:
+        return []
+    colored = tips.copy()
+    colored["harmonized"] = colored["harmonized_count"]
+    colored = attach_count_colors(colored, "harmonized")
+    colored["radius"] = 12000
+    keep = ["radius", "fill_r", "fill_g", "fill_b", *GRID_TOOLTIP_FIELDS]
+    return as_records(colored[keep])
+
+
+def show_map(records, tooltip, radius_min, radius_max, map_key, bbox=None, view_state=None, under_records=None):
     layers = []
     if bbox is not None and not bbox_is_world(bbox):
         south, north, west, east = bbox
@@ -196,24 +232,10 @@ def show_map(records, tooltip, radius_min, radius_max, map_key, bbox=None, view_
                 pickable=False,
             )
         )
-    layers.append(
-        pdk.Layer(
-            "ScatterplotLayer",
-            data=records,
-            get_position="[lon, lat]",
-            get_radius="radius",
-            get_fill_color="[fill_r, fill_g, fill_b, 210]",
-            get_line_color=[30, 30, 30, 180],
-            pickable=True,
-            opacity=0.9,
-            stroked=True,
-            filled=True,
-            line_width_min_pixels=1,
-            radius_min_pixels=radius_min,
-            radius_max_pixels=radius_max,
-            auto_highlight=True,
-        )
-    )
+    # The under-layer is context. Leave it unpickable so hover hits the fires on top.
+    if under_records:
+        layers.append(_scatter(under_records, 3, 22, pickable=False))
+    layers.append(_scatter(records, radius_min, radius_max, pickable=True))
     deck = pdk.Deck(
         layers=layers,
         initial_view_state=view_state or view_for_bbox(bbox),
@@ -417,6 +439,21 @@ def point_tooltip_fields(frame: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+TOOLTIP_STYLE = {"backgroundColor": "#172033", "color": "white", "fontSize": "13px"}
+
+POINT_TOOLTIP_FIELDS = (
+    "lat_label",
+    "lon_label",
+    "date_label",
+    "time_label",
+    "sat_label",
+    "inst_label",
+    "conf_label",
+    "frp_label",
+    "bright_label",
+    "when_label",
+)
+
 POINT_TOOLTIP = {
     "html": (
         "<b>{lat_label}, {lon_label}</b><br/>"
@@ -427,8 +464,10 @@ POINT_TOOLTIP = {
         "Brightness: {bright_label}<br/>"
         "{when_label}"
     ),
-    "style": {"backgroundColor": "#172033", "color": "white", "fontSize": "13px"},
+    "style": TOOLTIP_STYLE,
 }
+
+GRID_TOOLTIP = {"html": GRID_TOOLTIP_HTML, "style": TOOLTIP_STYLE}
 
 
 def describe_click(state) -> None:
@@ -443,6 +482,18 @@ def describe_click(state) -> None:
     elif isinstance(objects, list) and objects:
         row = objects[0]
     if not isinstance(row, dict):
+        return
+    if "harmonized_count" in row or "modis_n" in row:
+        st.caption(
+            f"{row.get('lat', '')}, {row.get('lon', '')} · "
+            f"cell {row.get('south', '')} to {row.get('north', '')}, "
+            f"{row.get('west', '')} to {row.get('east', '')} · "
+            f"{row.get('date_range', '')} · "
+            f"MODIS n {row.get('modis_n', '')} · VIIRS n {row.get('viirs_n', '')} · "
+            f"VIIRS/k {row.get('viirs_over_k', '')} · "
+            f"harmonized {row.get('harmonized_count', '')} · "
+            f"FRP sum {row.get('frp_sum', '')} MW · mean {row.get('frp_mean', '')} MW"
+        )
         return
     bits = [
         f"{row.get('lat_label', row.get('lat', ''))}, {row.get('lon_label', row.get('lon', ''))}",
@@ -741,7 +792,14 @@ def render_archive() -> None:
     # Recomputed every run from the dates and rectangle on screen. Not stored.
     load_points_now = should_load_points(start_date, end_date, bbox)
     bbox_key = tuple(round(float(value), 4) for value in bbox)
-    if "map_view" not in st.session_state:
+    region_selected = not bbox_is_world(bbox)
+    prefer_points = region_selected and load_points_now
+    region_token = (start_date.isoformat(), end_date.isoformat(), bbox_key, source_names)
+    if prefer_points and st.session_state.get("points_view_for") != region_token:
+        # A new rectangle that can load fires opens on those points.
+        st.session_state["map_view"] = "Raw detections"
+        st.session_state["points_view_for"] = region_token
+    elif "map_view" not in st.session_state:
         st.session_state["map_view"] = "Harmonized grid"
     view = st.radio(
         "Map view",
@@ -882,44 +940,35 @@ def render_archive() -> None:
                     "fill_r",
                     "fill_g",
                     "fill_b",
-                    "lat_label",
-                    "lon_label",
-                    "date_label",
-                    "time_label",
-                    "sat_label",
-                    "inst_label",
-                    "conf_label",
-                    "frp_label",
-                    "bright_label",
-                    "when_label",
+                    *POINT_TOOLTIP_FIELDS,
                 ]
             ]
         )
-        state = show_map(records, POINT_TOOLTIP, 2, 14, "archive-points", bbox=bbox)
+        under = None
+        if not harmonized.empty:
+            under = _grid_map_records(harmonized, start_date, end_date, k_value)
+        state = show_map(
+            records,
+            POINT_TOOLTIP,
+            2,
+            14,
+            "archive-points",
+            bbox=bbox,
+            under_records=under,
+        )
         describe_click(state)
         st.caption(f"{len(points):,} detections in the query.{sample_note}")
     elif not harmonized.empty:
-        drawn = harmonized.rename(columns={"cell_lon": "lon", "cell_lat": "lat"})
-        drawn = attach_count_colors(drawn, "harmonized")
-        drawn["radius"] = 12000
-        drawn["date_label"] = pd.to_datetime(drawn["date"]).dt.strftime("%Y-%m-%d")
-        drawn["harmonized_label"] = drawn["harmonized"].round(2)
-        drawn["frp_label"] = drawn["frp_sum"].round(1)
-        records = as_records(
-            drawn[
-                ["lon", "lat", "radius", "fill_r", "fill_g", "fill_b", "date_label", "harmonized_label", "frp_label"]
-            ]
-        )
-        show_map(
-            records,
-            {
-                "html": "{date_label}<br/>MODIS-equivalent hotspots: {harmonized_label}<br/>FRP sum: {frp_label} MW",
-                "style": {"backgroundColor": "#172033", "color": "white"},
-            },
-            3,
-            22,
-            "archive-grid",
-            bbox=bbox,
+        records = _grid_map_records(harmonized, start_date, end_date, k_value)
+        describe_click(
+            show_map(
+                records,
+                GRID_TOOLTIP,
+                3,
+                22,
+                "archive-grid",
+                bbox=bbox,
+            )
         )
         st.caption(f"{len(harmonized):,} grid cells. Harmonized = MODIS n + VIIRS n / {k_value:.3f}.")
     else:
@@ -1349,16 +1398,7 @@ if view == "Raw detections" and mode == "detections":
                     "fill_r",
                     "fill_g",
                     "fill_b",
-                    "lat_label",
-                    "lon_label",
-                    "date_label",
-                    "time_label",
-                    "sat_label",
-                    "inst_label",
-                    "conf_label",
-                    "frp_label",
-                    "bright_label",
-                    "when_label",
+                    *POINT_TOOLTIP_FIELDS,
                 ]
             ]
         )

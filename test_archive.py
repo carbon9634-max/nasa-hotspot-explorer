@@ -16,6 +16,9 @@ from archive import (
     burn_calendar,
     cells_from_points,
     chart_date_window,
+    GRID_TOOLTIP_FIELDS,
+    GRID_TOOLTIP_HTML,
+    grid_tooltip_frame,
     harmonize_archive_grid,
     load_daily_grid,
     load_daily_totals,
@@ -256,6 +259,76 @@ class AmazonGridTests(unittest.TestCase):
         self.assertEqual(len(grid), 1)
         self.assertEqual(int(grid.iloc[0]["n_hotspots"]), 3)
         self.assertEqual(grid.iloc[0]["sensor"], "VIIRS")
+
+    def test_grid_tooltip_has_the_fields_the_map_reads(self):
+        harmonized = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-11-12"]),
+                "cell_lat": [-9.875],
+                "cell_lon": [-59.875],
+                "modis_n": [2],
+                "viirs_n": [5],
+                "harmonized": [3.0],
+                "frp_sum": [10.0],
+            }
+        )
+        tips = grid_tooltip_frame(harmonized, date(2026, 11, 10), date(2026, 11, 16), k=5)
+        row = tips.iloc[0]
+        for name in GRID_TOOLTIP_FIELDS:
+            self.assertIn(name, tips.columns)
+            self.assertIn("{" + name + "}", GRID_TOOLTIP_HTML)
+        self.assertEqual(float(row["lat"]), -9.875)
+        self.assertEqual(float(row["lon"]), -59.875)
+        self.assertEqual(float(row["south"]), -10.0)
+        self.assertEqual(float(row["north"]), -9.75)
+        self.assertEqual(row["date_range"], "2026-11-10 to 2026-11-16")
+        self.assertEqual(row["cell_date"], "2026-11-12")
+        self.assertEqual(int(row["modis_n"]), 2)
+        self.assertEqual(int(row["viirs_n"]), 5)
+        self.assertAlmostEqual(float(row["viirs_over_k"]), 1.0)
+        self.assertAlmostEqual(float(row["harmonized_count"]), 3.0)
+        self.assertAlmostEqual(float(row["frp_mean"]), round(10 / 7, 2))
+
+    def test_pydeck_tooltip_keeps_the_tip_column(self):
+        import json
+
+        import pydeck as pdk
+
+        harmonized = pd.DataFrame(
+            {
+                "date": pd.to_datetime(["2026-11-12"]),
+                "cell_lat": [-9.875],
+                "cell_lon": [-59.875],
+                "modis_n": [2],
+                "viirs_n": [5],
+                "harmonized": [3.0],
+                "frp_sum": [10.0],
+            }
+        )
+        tips = grid_tooltip_frame(harmonized, date(2026, 11, 10), date(2026, 11, 16), k=5)
+        record = {name: tips.iloc[0][name] for name in GRID_TOOLTIP_FIELDS}
+        record.update(radius=12000, fill_r=68, fill_g=1, fill_b=84)
+        layer = pdk.Layer(
+            "ScatterplotLayer",
+            data=[record],
+            get_position="[lon, lat]",
+            get_radius="radius",
+            get_fill_color="[fill_r, fill_g, fill_b, 210]",
+            pickable=True,
+        )
+        deck = pdk.Deck(layers=[layer], tooltip={"html": GRID_TOOLTIP_HTML})
+        payload = json.loads(deck.to_json())
+        data = payload["layers"][0]["data"][0]
+        self.assertEqual(deck._tooltip["html"], GRID_TOOLTIP_HTML)
+        self.assertTrue(layer.pickable)
+        self.assertTrue(payload["layers"][0]["pickable"])
+        for name in GRID_TOOLTIP_FIELDS:
+            self.assertIn("{" + name + "}", deck._tooltip["html"])
+            self.assertIn(name, data)
+        self.assertEqual(int(data["modis_n"]), 2)
+        self.assertEqual(float(data["viirs_over_k"]), 1.0)
+        self.assertIn("MODIS n:", GRID_TOOLTIP_HTML)
+        self.assertIn("VIIRS/k:", GRID_TOOLTIP_HTML)
 
 
 if __name__ == "__main__":

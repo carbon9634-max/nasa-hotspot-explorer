@@ -596,6 +596,65 @@ def _grid_frame(frame: pd.DataFrame, by_day: bool, start: date) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+# Placeholders in GRID_TOOLTIP_HTML. The map layer must carry every one of these.
+GRID_TOOLTIP_FIELDS = (
+    "lat",
+    "lon",
+    "south",
+    "north",
+    "west",
+    "east",
+    "date_range",
+    "cell_date",
+    "modis_n",
+    "viirs_n",
+    "viirs_over_k",
+    "harmonized_count",
+    "frp_sum",
+    "frp_mean",
+)
+
+GRID_TOOLTIP_HTML = (
+    "<b>{lat}, {lon}</b><br/>"
+    "Cell {south} to {north}, {west} to {east}<br/>"
+    "{date_range}<br/>"
+    "Day {cell_date}<br/>"
+    "MODIS n: {modis_n}<br/>"
+    "VIIRS n: {viirs_n}<br/>"
+    "VIIRS/k: {viirs_over_k}<br/>"
+    "Harmonized: {harmonized_count}<br/>"
+    "FRP sum: {frp_sum} MW<br/>"
+    "FRP mean: {frp_mean} MW"
+)
+
+
+def grid_tooltip_frame(harmonized: pd.DataFrame, start, end, k: float) -> pd.DataFrame:
+    """Columns the pydeck tooltip template reads. Names match GRID_TOOLTIP_HTML."""
+
+    if harmonized is None or harmonized.empty:
+        return pd.DataFrame(columns=list(GRID_TOOLTIP_FIELDS))
+    frame = harmonized.copy()
+    frame["lat"] = pd.to_numeric(frame["cell_lat"], errors="coerce").round(4)
+    frame["lon"] = pd.to_numeric(frame["cell_lon"], errors="coerce").round(4)
+    frame["south"] = (frame["lat"] - 0.125).round(4)
+    frame["north"] = (frame["lat"] + 0.125).round(4)
+    frame["west"] = (frame["lon"] - 0.125).round(4)
+    frame["east"] = (frame["lon"] + 0.125).round(4)
+    frame["date_range"] = f"{_as_date(start).isoformat()} to {_as_date(end).isoformat()}"
+    if "date" in frame.columns:
+        frame["cell_date"] = pd.to_datetime(frame["date"]).dt.strftime("%Y-%m-%d").fillna("")
+    else:
+        frame["cell_date"] = ""
+    frame["modis_n"] = pd.to_numeric(frame.get("modis_n", 0), errors="coerce").fillna(0).round(0).astype(int)
+    frame["viirs_n"] = pd.to_numeric(frame.get("viirs_n", 0), errors="coerce").fillna(0).round(0).astype(int)
+    frame["viirs_over_k"] = (frame["viirs_n"] / k if k else 0).round(2)
+    frame["harmonized_count"] = pd.to_numeric(frame["harmonized"], errors="coerce").fillna(0).round(2)
+    frame["frp_sum"] = pd.to_numeric(frame["frp_sum"], errors="coerce").fillna(0).round(1)
+    count = (frame["modis_n"] + frame["viirs_n"]).replace(0, pd.NA)
+    frame["frp_mean"] = (frame["frp_sum"] / count).fillna(0).round(2)
+    return frame
+
+
 def harmonize_archive_grid(grid: pd.DataFrame, k: float) -> pd.DataFrame:
     """One row per cell (and day, if the grid is still daily).
 
