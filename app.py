@@ -20,6 +20,7 @@ from archive import (
     daily_from_cells,
     harmonize_archive_grid,
     load_daily_grid,
+    chart_date_window,
     load_daily_totals,
     load_manifest,
     load_points,
@@ -739,18 +740,19 @@ def render_archive() -> None:
     source_names = tuple(name.lower() for name in sensors) or ("modis", "viirs")
     # Recomputed every run from the dates and rectangle on screen. Not stored.
     load_points_now = should_load_points(start_date, end_date, bbox)
-    bbox_key = tuple(float(value) for value in bbox)
+    bbox_key = tuple(round(float(value), 4) for value in bbox)
+    if "map_view" not in st.session_state:
+        st.session_state["map_view"] = "Harmonized grid"
+    view = st.radio(
+        "Map view",
+        ["Raw detections", "Harmonized grid"],
+        horizontal=True,
+        key="map_view",
+        width="stretch",
+    )
     try:
-        with st.spinner("Reading the fire archive…"):
-            grid, _by_day = cached_archive_grid(
-                kind,
-                location,
-                start_date.isoformat(),
-                end_date.isoformat(),
-                source_names,
-                bbox_key,
-            )
-            daily = cached_archive_totals(
+        with st.spinner("Loading the map…"):
+            grid, by_day = cached_archive_grid(
                 kind,
                 location,
                 start_date.isoformat(),
@@ -759,7 +761,7 @@ def render_archive() -> None:
                 bbox_key,
             )
             points, truncated = (None, False)
-            if load_points_now:
+            if view == "Raw detections" and load_points_now:
                 points, truncated = cached_archive_points(
                     kind,
                     location,
@@ -852,13 +854,6 @@ def render_archive() -> None:
                 "(nominal and high confidence, type 0 or missing)."
             )
 
-    view = st.radio(
-        "Map view",
-        ["Raw detections", "Harmonized grid"],
-        horizontal=True,
-        key="map_view",
-        width="stretch",
-    )
     if view == "Raw detections" and points is not None:
         st.markdown(legend_html("sensor"), unsafe_allow_html=True)
     else:
@@ -955,7 +950,25 @@ def render_archive() -> None:
         )
         st.plotly_chart(style_chart(fig_bar), width="stretch", theme=None)
         st.caption("VIIRS ÷ k is the MODIS-equivalent count. The harmonized map adds that to the MODIS count.")
-    render_selection_charts(daily, harmonized, points, k_value)
+    with st.spinner("Loading charts for this selection…"):
+        if by_day and grid is not None and not grid.empty:
+            daily = daily_from_cells(grid)
+        else:
+            chart_start, chart_end = chart_date_window(start_date, end_date)
+            daily = cached_archive_totals(
+                kind,
+                location,
+                chart_start.isoformat(),
+                chart_end.isoformat(),
+                source_names,
+                bbox_key,
+            )
+        if daily is not None and not daily.empty:
+            daily = daily.copy()
+            daily["date"] = pd.to_datetime(daily["date"])
+            newest_years = sorted(daily["date"].dt.year.unique())[-3:]
+            daily = daily[daily["date"].dt.year.isin(newest_years)]
+    render_selection_charts(daily, harmonized, points if view == "Raw detections" else None, k_value)
 
 
 def load_saved_copy() -> pd.DataFrame:

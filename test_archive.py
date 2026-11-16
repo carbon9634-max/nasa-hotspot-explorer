@@ -15,11 +15,13 @@ from archive import (
     archive_location,
     burn_calendar,
     cells_from_points,
+    chart_date_window,
     harmonize_archive_grid,
     load_daily_grid,
     load_daily_totals,
     load_points,
     normalize_manifest,
+    row_groups_for_range,
     should_load_points,
 )
 
@@ -200,6 +202,60 @@ class AmazonGridTests(unittest.TestCase):
         )
         self.assertEqual(manifest["agg_end"], date(2025, 12, 31))
         self.assertEqual(manifest["latest"], date(2026, 11, 15))
+        shaped = normalize_manifest(
+            {
+                "date_min": "2016-11-15",
+                "date_max": "2026-11-14",
+                "counts": {"viirs": {"2024": {"rows": 10, "date_min": "2024-01-01", "date_max": "2024-12-31"}}},
+                "agg": {"path": "agg/daily_grid.parquet", "cells": 39_000_000, "bytes": 154_000_000},
+            }
+        )
+        self.assertEqual(shaped["latest"], date(2026, 11, 14))
+        self.assertEqual(shaped["agg_end"], date(2026, 11, 14))
+        self.assertEqual(chart_date_window(date(2016, 11, 15), date(2026, 11, 15))[0], date(2024, 1, 1))
+
+    def test_row_groups_outside_the_week_are_not_read(self):
+        import pyarrow.parquet as pq
+
+        early = pa.table(
+            {
+                "acq_date": pa.array([date(2016, 1, 1)], pa.date32()),
+                "source": ["modis"],
+                "lat_bin": pa.array([0.0], pa.float32()),
+                "lon_bin": pa.array([0.0], pa.float32()),
+                "n": pa.array([100], pa.int32()),
+                "frp_sum": pa.array([1.0], pa.float32()),
+            }
+        )
+        late = pa.table(
+            {
+                "acq_date": pa.array([date(2026, 11, 12)], pa.date32()),
+                "source": ["viirs"],
+                "lat_bin": pa.array([-10.0], pa.float32()),
+                "lon_bin": pa.array([-60.0], pa.float32()),
+                "n": pa.array([3], pa.int32()),
+                "frp_sum": pa.array([2.0], pa.float32()),
+            }
+        )
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "agg").mkdir()
+            path = root / "agg" / "daily_grid.parquet"
+            writer = pq.ParquetWriter(path, early.schema)
+            writer.write_table(early)
+            writer.write_table(late)
+            writer.close()
+            chosen = row_groups_for_range(
+                pq.ParquetFile(path), date(2026, 11, 10), date(2026, 11, 16), ["modis", "viirs"]
+            )
+            self.assertEqual(chosen, [1])
+            grid, by_day = load_daily_grid(
+                "local", tmp, date(2026, 11, 10), date(2026, 11, 16), bbox=(-20, 0, -70, -50)
+            )
+        self.assertTrue(by_day)
+        self.assertEqual(len(grid), 1)
+        self.assertEqual(int(grid.iloc[0]["n_hotspots"]), 3)
+        self.assertEqual(grid.iloc[0]["sensor"], "VIIRS")
 
 
 if __name__ == "__main__":

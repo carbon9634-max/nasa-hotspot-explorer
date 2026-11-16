@@ -30,6 +30,7 @@ POINT_DAY_LIMIT = 31
 SMALL_REGION_DEGREES = 20.0
 MAX_POINT_ROWS = 250_000
 MAX_RENDER_POINTS = 50_000
+MAX_CHART_YEARS = 3
 
 POINT_COLUMNS = [
     "latitude",
@@ -324,24 +325,126 @@ def _points_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return out.dropna(subset=["lat", "lon", "date"]).reset_index(drop=True)
 
 
-def _accumulate(dataset: ds.Dataset, filt, keys: list[str]) -> pd.DataFrame:
-    columns = [column for column in list(dict.fromkeys([*keys, "n", "frp_sum"])) if column in dataset.schema.names]
-    group_keys = [key for key in keys if key in columns]
-    acc = None
-    for batch in dataset.scanner(filter=filt, columns=columns).to_batches():
-        part = batch.to_pandas()
-        if part.empty:
+def chart_date_window(start, end) -> tuple[date, date]:
+    """Years in the selection, and never more than three (the latest ones)."""
+
+    start_d, end_d = _as_date(start), _as_date(end)
+    if end_d.year - start_d.year + 1 <= MAX_CHART_YEARS:
+        return start_d, end_d
+    clipped = date(end_d.year - (MAX_CHART_YEARS - 1), 1, 1)
+    if clipped < start_d:
+        clipped = start_d
+    return clipped, end_d
+
+
+def _as_stat_date(value):
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, (int, float)):
+        return date(1970, 1, 1) + timedelta(days=int(value))
+    text = str(value)[:10]
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def row_groups_for_range(parquet_file, start, end, sources: list[str] | None = None) -> list[int]:
+    """Row groups whose acq_date statistics overlap the range.
+
+    The archive file stores one source-month per row group, sorted by date.
+    Groups outside the range are not read.
+    """
+
+    start_d, end_d = _as_date(start), _as_date(end)
+    schema = parquet_file.schema_arrow
+    date_index = schema.get_field_index("acq_date")
+    source_index = schema.get_field_index("source") if "source" in schema.names else -1
+    wanted = set(_sources(sources) or [])
+    chosen = []
+    for index in range(parquet_file.num_row_groups):
+        group = parquet_file.metadata.row_group(index)
+        if source_index >= 0 and wanted:
+            source_stats = group.column(source_index).statistics
+            if source_stats is not None and source_stats.has_min_max:
+                low = str(source_stats.min).lower()
+                high = str(source_stats.max).lower()
+                if low == high and low not in wanted:
+                    continue
+        date_stats = group.column(date_index).statistics
+        if date_stats is None or not date_stats.has_min_max:
+            chosen.append(index)
             continue
-        grouped = part.groupby(group_keys, as_index=False, dropna=False).agg(
-            n=("n", "sum"), frp_sum=("frp_sum", "sum")
-        )
-        acc = grouped if acc is None else pd.concat([acc, grouped], ignore_index=True)
-        acc = acc.groupby(group_keys, as_index=False, dropna=False).agg(
-            n=("n", "sum"), frp_sum=("frp_sum", "sum")
-        )
-    if acc is None:
+        low = _as_stat_date(date_stats.min)
+        high = _as_stat_date(date_stats.max)
+        if low is None or high is None or high < start_d or low > end_d:
+            if low is not None and high is not None:
+                continue
+        chosen.append(index)
+    return chosen
+
+
+def _open_agg_file(kind: str, location: str):
+    import pyarrow.parquet as pq
+
+    if kind == "local":
+        path = str(Path(location) / "agg" / "daily_grid.parquet")
+        return pq.ParquetFile(path)
+    filesystem = _filesystem(kind)
+    path = f"{_root(kind, location)}/agg/daily_grid.parquet"
+    return pq.ParquetFile(path, filesystem=filesystem)
+
+
+def read_agg_rows(
+    kind: str,
+    location: str,
+    start,
+    end,
+    sources: list[str] | None = None,
+    bbox: tuple[float, float, float, float] | None = None,
+    columns: list[str] | None = None,
+) -> pd.DataFrame:
+    """Read only date-overlapping row groups, then apply the box."""
+
+    start_d, end_d = _as_date(start), _as_date(end)
+    parquet_file = _open_agg_file(kind, location)
+    available = set(parquet_file.schema_arrow.names)
+    wanted = [column for column in (columns or ["acq_date", "lat_bin", "lon_bin", "source", "n", "frp_sum"]) if column in available]
+    indexes = row_groups_for_range(parquet_file, start_d, end_d, sources)
+    if not indexes:
+        return pd.DataFrame(columns=wanted)
+    table = parquet_file.read_row_groups(indexes, columns=wanted)
+    frame = table.to_pandas()
+    if frame.empty:
+        return frame
+    if "acq_date" in frame.columns:
+        days = pd.to_datetime(frame["acq_date"]).dt.date
+        frame = frame[(days >= start_d) & (days <= end_d)]
+    if sources and "source" in frame.columns:
+        allowed = set(_sources(sources) or [])
+        frame = frame[frame["source"].astype(str).str.lower().isin(allowed)]
+    if bbox is not None and not bbox_is_world(bbox) and {"lat_bin", "lon_bin"}.issubset(frame.columns):
+        south, north, west, east = bbox
+        frame = frame[
+            (frame["lat_bin"] >= south - 0.25)
+            & (frame["lat_bin"] < north)
+            & (frame["lon_bin"] >= west - 0.25)
+            & (frame["lon_bin"] < east)
+        ]
+    return frame.reset_index(drop=True)
+
+
+def _frame_from_agg(frame: pd.DataFrame, keys: list[str]) -> pd.DataFrame:
+    group_keys = [key for key in keys if key in frame.columns]
+    if frame.empty:
         return pd.DataFrame(columns=[*group_keys, "n", "frp_sum"])
-    return acc
+    return frame.groupby(group_keys, as_index=False, dropna=False).agg(
+        n=("n", "sum"), frp_sum=("frp_sum", "sum")
+    )
 
 
 def load_daily_grid(
@@ -360,15 +463,12 @@ def load_daily_grid(
 
     start_d, end_d = _as_date(start), _as_date(end)
     by_day = inclusive_days(start_d, end_d) <= POINT_DAY_LIMIT
-    dataset = open_grid(kind, location)
-    schema = dataset.schema
-    filt = _combine(
-        _date_filter(schema, "acq_date", start_d, end_d),
-        ds.field("source").isin(_sources(sources)) if _sources(sources) and "source" in schema.names else None,
-        _bbox_filter(schema, "lat_bin", "lon_bin", bbox, cell=0.25),
-    )
+    columns = ["acq_date", "lat_bin", "lon_bin", "source", "n", "frp_sum"]
+    rows = read_agg_rows(kind, location, start_d, end_d, sources, bbox, columns)
+    if not by_day and "acq_date" in rows.columns:
+        rows = rows.drop(columns=["acq_date"])
     keys = ["lat_bin", "lon_bin", "source"] + (["acq_date"] if by_day else [])
-    acc = _accumulate(dataset, filt, keys)
+    acc = _frame_from_agg(rows, keys)
     return _grid_frame(acc, by_day, start_d), by_day
 
 
@@ -380,17 +480,19 @@ def load_daily_totals(
     sources: list[str] | None = None,
     bbox: tuple[float, float, float, float] | None = None,
 ) -> pd.DataFrame:
-    """One row per day per sensor inside the box. Small enough for a 10-year chart."""
+    """One row per day per sensor. Only the selected years, and at most three."""
 
-    start_d, end_d = _as_date(start), _as_date(end)
-    dataset = open_grid(kind, location)
-    schema = dataset.schema
-    filt = _combine(
-        _date_filter(schema, "acq_date", start_d, end_d),
-        ds.field("source").isin(_sources(sources)) if _sources(sources) and "source" in schema.names else None,
-        _bbox_filter(schema, "lat_bin", "lon_bin", bbox, cell=0.25),
+    start_d, end_d = chart_date_window(start, end)
+    rows = read_agg_rows(
+        kind,
+        location,
+        start_d,
+        end_d,
+        sources,
+        bbox,
+        ["acq_date", "lat_bin", "lon_bin", "source", "n", "frp_sum"],
     )
-    acc = _accumulate(dataset, filt, ["acq_date", "source"])
+    acc = _frame_from_agg(rows, ["acq_date", "source"])
     if acc.empty:
         return pd.DataFrame(columns=["date", "sensor", "source", "n_hotspots", "frp_sum"])
     out = acc.copy()
@@ -505,25 +607,16 @@ def harmonize_archive_grid(grid: pd.DataFrame, k: float) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
     work = grid.copy()
     work["date"] = pd.to_datetime(work["date"])
-    keys = ["date", "cell_lat", "cell_lon"]
-    rows = []
-    for key, part in work.groupby(keys, dropna=False):
-        modis = float(part.loc[part["sensor"].eq("MODIS"), "n_hotspots"].sum())
-        viirs = float(part.loc[part["sensor"].eq("VIIRS"), "n_hotspots"].sum())
-        rows.append(
-            {
-                "date": key[0],
-                "cell_lat": key[1],
-                "cell_lon": key[2],
-                "modis_n": modis,
-                "viirs_n": viirs,
-                "harmonized": modis + (viirs / k if k else 0),
-                "frp_sum": float(part["frp_sum"].sum(skipna=True)),
-            }
-        )
-    if not rows:
-        return pd.DataFrame(columns=columns)
-    return pd.DataFrame(rows)
+    counts = pd.to_numeric(work["n_hotspots"], errors="coerce").fillna(0)
+    work["modis_n"] = counts.where(work["sensor"].eq("MODIS"), 0.0)
+    work["viirs_n"] = counts.where(work["sensor"].eq("VIIRS"), 0.0)
+    grouped = work.groupby(["date", "cell_lat", "cell_lon"], as_index=False, dropna=False).agg(
+        modis_n=("modis_n", "sum"),
+        viirs_n=("viirs_n", "sum"),
+        frp_sum=("frp_sum", "sum"),
+    )
+    grouped["harmonized"] = grouped["modis_n"] + (grouped["viirs_n"] / k if k else 0)
+    return grouped[columns]
 
 
 def default_archive_dates(today: date | None = None, coverage_end: date | None = None) -> tuple[date, date, date]:
@@ -554,10 +647,22 @@ def _parse_day(value):
 
 
 def normalize_manifest(data: dict | None) -> dict:
-    """Pick coverage dates out of a loosely shaped manifest.json."""
+    """Pick coverage dates out of a loosely shaped manifest.json.
+
+    The ingest job writes ``date_min`` / ``date_max`` plus a nested ``counts``
+    tree. Older notes used ``agg_end`` / ``points_end``. Either shape is fine,
+    and an unexpected file returns an empty coverage dict.
+    """
 
     if not isinstance(data, dict):
         return {}
+    try:
+        return _normalize_manifest_inner(data)
+    except Exception:
+        return {}
+
+
+def _normalize_manifest_inner(data: dict) -> dict:
     nested = {}
     for key in ("aggregate", "agg", "daily_grid", "points", "detections"):
         block = data.get(key)
@@ -593,6 +698,12 @@ def normalize_manifest(data: dict | None) -> dict:
     points_end = pick("points_end", "detections_end") or from_block(
         nested.get("points") or nested.get("detections"), "end", "max", "max_date"
     )
+    overall_start = _parse_day(data.get("date_min")) or _parse_day(data.get("requested_start"))
+    overall_end = _parse_day(data.get("date_max")) or _parse_day(data.get("requested_end"))
+    points_start = points_start or overall_start
+    points_end = points_end or overall_end
+    agg_start = agg_start or overall_start
+    agg_end = agg_end or overall_end
     latest_candidates = [day for day in (agg_end, points_end) if day is not None]
     return {
         "agg_start": agg_start,
