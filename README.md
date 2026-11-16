@@ -6,6 +6,93 @@ The app is a Streamlit dashboard with a pydeck map. It ships with a 100,000-row 
 
 The science lives in `harmonize.py`. It follows `Submission_Project.ipynb`, which is unchanged.
 
+Handoff for the next person or agent: [AGENTS.md](AGENTS.md). Diagrams: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). Reload the archive: [ingest/README.md](ingest/README.md).
+
+Live service: https://emberscope-156735151789.us-central1.run.app
+
+## Tech stack
+
+| Layer | Technology | Version / note |
+| --- | --- | --- |
+| Data sources | NASA FIRMS country zips and area API | MODIS and VIIRS S-NPP. Live app also calls `VIIRS_SNPP_NRT` and `MODIS_NRT` |
+| Ingestion | Python, Cloud Build | `ingest/requirements.txt`: pandas 2.2.3, pyarrow 18.1.0, numpy 2.1.3, requests 2.32.3, google-cloud-storage 2.18.2. Python 3.11 |
+| Storage | Google Cloud Storage parquet | Bucket `emberscope-data-156735151789`. Hive layout plus `agg/daily_grid.parquet` |
+| Processing | `harmonize.py`, `archive.py` | pandas 3.1.1, numpy 2.4.6, pyarrow 26.0.1. k = 5.190318 unless `HARMONIZE_K` is set |
+| App | Streamlit | 1.67.0 on Python 3.11 |
+| Visualization | pydeck, folium, Plotly | pydeck 0.9.3, folium 1.0.0, streamlit-folium 0.27.4, plotly 7.1.0. CARTO Voyager basemap. OpenStreetMap tiles for the draw box |
+| Hosting | Cloud Run, Artifact Registry, Cloud Build | Service `emberscope`, 4 GiB, 2 CPU, timeout 300s, max 2 instances, `us-central1` |
+| CI/CD | GitHub Actions | `.github/workflows/deploy.yml` blue-green. Not switched on until Workload Identity variables exist |
+| Security | Secret Manager | `FIRMS_MAP_KEY` only. Never committed |
+| GCS client in the app | gcsfs, google-cloud-storage | gcsfs 2026.10.1, google-cloud-storage 3.17.1 |
+| Testing | unittest | `test_harmonize.py`, `test_archive.py`, `test_dockerfile.py` |
+| Planned | Angular, Go, Kubernetes | Not in this repo yet |
+
+## Flow
+
+```mermaid
+flowchart LR
+  subgraph nasa [NASA FIRMS]
+    Zips[Country zips 2016 to 2025]
+    Api[Area API 2026]
+  end
+  Secret[Secret Manager]
+  Build[Cloud Build ingest]
+  Gcs[GCS parquet and daily grid]
+  Registry[Artifact Registry]
+  Actions[GitHub Actions]
+  App[Cloud Run EmberScope]
+  Kid[Browser]
+
+  Zips --> Build
+  Api --> Build
+  Secret --> Build
+  Secret --> App
+  Build --> Gcs
+  Gcs --> App
+  Actions --> Registry
+  Registry --> App
+  App --> Kid
+```
+
+```mermaid
+sequenceDiagram
+  actor Kid as User
+  participant App as EmberScope
+  participant Gcs as GCS
+  Kid->>App: Dates plus a rectangle
+  alt About 31 days or a box is drawn
+    App->>Gcs: Read point files
+    Gcs-->>App: Detections
+    App->>App: Grid from points if daily grid has a gap
+  else Long range and whole world
+    App->>Gcs: Read daily grid
+    Gcs-->>App: Cell counts
+  end
+  App->>App: MODIS n plus VIIRS n over k
+  App-->>Kid: Street map and charts
+```
+
+```mermaid
+stateDiagram-v2
+  [*] --> Raw
+  Raw --> Unified: letters and scores to one scale
+  Unified --> Filtered: nominal or high, type 0 or null
+  state fork <<choice>>
+  Filtered --> fork
+  fork --> FromGrid: daily_grid covers the dates
+  fork --> Deduped: otherwise use points
+  Deduped --> Binned: one hit per 1 km, then 0.25 degree cells
+  FromGrid --> Scaled: n is already the cell count
+  Binned --> Scaled
+  state sensor <<choice>>
+  Scaled --> sensor
+  sensor --> Modis: MODIS
+  sensor --> Viirs: VIIRS
+  Modis --> Harmonized: keep n
+  Viirs --> Harmonized: n divided by k
+  Harmonized --> [*]
+```
+
 ## What the map shows
 
 The basemap is CARTO Voyager, a light street map. No Mapbox token. Scroll and the +/- buttons zoom.
@@ -16,7 +103,7 @@ The basemap is CARTO Voyager, a light street map. No Mapbox token. Scroll and th
 
 Drag a rectangle on the street map under the legend to limit the region, or type south/north/west/east in the sidebar. **Clear region** removes the box. The FRP slider is one range. Its ends stay at the min and max for the current dates and sensors, so lowering the max does not trap the handle.
 
-**Archive dates.** With `DATA_BUCKET` or `DATA_PATH` set, the date control runs from 15 November 2016 through today and opens on the last 7 days. Individual points load when that range is 31 days or less, or when the box is smaller than about 20° on a side. Wider requests use the daily grid only. The map draws at most 50,000 points and says when it sampled.
+**Archive dates.** With `DATA_BUCKET` or `DATA_PATH` set, the date control runs from 15 November 2016 through today and opens on the last 7 days the manifest says are loaded. Individual points load when that range is 31 days or less, or when any rectangle is drawn. A long range with no rectangle uses the daily grid only. The map draws at most 50,000 points and says when it sampled.
 
 The sidebar date range chooses which days are included. The slider under the title chooses which one day the map draws. Satellite, sensor, confidence, FRP, and day/night filters apply before the grid is built.
 
@@ -42,18 +129,19 @@ On the bundled sample, after steps 3 and 4, that ratio is **73,334 / 14,129 = 5.
 - The bundled file is a 100,000-row sample, not the full global archive. Some days in the range are missing, and the last few days are almost all MODIS.
 - Live mode is the latest FIRMS near real-time day (VIIRS SNPP NRT and MODIS NRT). Those detections can be revised.
 
-## Architecture
+## Data refresh
 
-```text
-Browser
-  └─ Streamlit (app.py)
-       ├─ pydeck + CARTO Voyager     fire points and the grid
-       ├─ folium Draw                rectangle region filter
-       ├─ harmonize.py               bundled sample and live NRT
-       ├─ archive.py                 10-year parquet in GCS or a local folder
-       ├─ app_data.csv               used only when DATA_BUCKET and DATA_PATH are unset
-       └─ FIRMS area API             Live (last 24h), needs FIRMS_MAP_KEY
+From `ingest/` (not the repo root):
+
+```bash
+gcloud builds submit \
+  --config cloudbuild.yaml \
+  --substitutions _DATA_BUCKET=emberscope-data-156735151789 \
+  --region us-central1 \
+  .
 ```
+
+`_FORCE=1` rebuilds finished years. `_REFRESH_API=1` refetches the current year from the FIRMS API. Details, the offshore-gap caveat, and the rate limit are in [ingest/README.md](ingest/README.md). The ingest tree is not copied into the Cloud Run app image.
 
 ## Archive in Cloud Storage
 
@@ -209,11 +297,13 @@ Keep the `Dockerfile` in this folder. `gcloud run deploy --source .` uploads the
 ```bash
 gcloud run deploy emberscope \
   --source . \
-  --region "$REGION" \
+  --region us-central1 \
   --allow-unauthenticated \
   --memory 4Gi \
   --cpu 2 \
+  --timeout 300 \
   --max-instances 2 \
+  --set-env-vars DATA_BUCKET=emberscope-data-156735151789 \
   --set-secrets FIRMS_MAP_KEY=FIRMS_MAP_KEY:latest
 ```
 

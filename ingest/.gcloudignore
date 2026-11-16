@@ -1,0 +1,6 @@
+.venv/
+tmp/
+*.log
+__pycache__/
+test_api_mock.py
+logs/

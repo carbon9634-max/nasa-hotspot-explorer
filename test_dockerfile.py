@@ -30,9 +30,13 @@ class DockerfileTests(unittest.TestCase):
         )
         self.assertIn("app_data.csv", copy_text)
         if "*.py" in copy_text:
-            return
-        missing = [name for name in modules if f"{name}.py" not in copy_text]
-        self.assertFalse(missing, f"Dockerfile COPY is missing {missing}")
+            pass
+        else:
+            missing = [name for name in modules if f"{name}.py" not in copy_text]
+            self.assertFalse(missing, f"Dockerfile COPY is missing {missing}")
+        for name in (".dockerignore", ".gcloudignore"):
+            ignored = (ROOT / name).read_text()
+            self.assertIn("ingest/", ignored, f"{name} must keep the ingest job out of the app image")
 
 
 if __name__ == "__main__":

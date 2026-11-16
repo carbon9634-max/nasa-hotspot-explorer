@@ -1,0 +1,35 @@
+# EmberScope: one-shot FIRMS 10-year ingestion into gs://${_DATA_BUCKET}
+# Run from this folder:
+#   gcloud builds submit --config cloudbuild.yaml --substitutions _DATA_BUCKET=emberscope-data-156735151789 --region us-central1 .
+steps:
+  - id: ingest
+    name: python:3.11-slim
+    entrypoint: bash
+    args:
+      - -c
+      - pip install -q --no-cache-dir -r requirements.txt && python ingest.py
+    env:
+      - DATA_BUCKET=${_DATA_BUCKET}
+      - START_DATE=${_START_DATE}
+      - WORKERS=${_WORKERS}
+      - FORCE=${_FORCE}
+      - REFRESH_API=${_REFRESH_API}
+      - WORKDIR=/workspace/_work
+      - PYTHONUNBUFFERED=1
+    secretEnv: ['FIRMS_MAP_KEY']
+substitutions:
+  _DATA_BUCKET: ''
+  _START_DATE: '2016-11-15'
+  _WORKERS: '5'
+  _FORCE: '0'
+  _REFRESH_API: '0'
+availableSecrets:
+  secretManager:
+    - versionName: projects/project-cfcc5008-1013-4766-820/secrets/FIRMS_MAP_KEY/versions/latest
+      env: FIRMS_MAP_KEY
+timeout: 7200s
+options:
+  machineType: E2_HIGHCPU_8
+  diskSizeGb: 200
+  logging: CLOUD_LOGGING_ONLY
+  substitutionOption: ALLOW_LOOSE
