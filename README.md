@@ -370,7 +370,7 @@ gcloud run services update-traffic emberscope \
 
 Example: `--to-revisions emberscope-rabc12341=100`.
 
-The repository variables below are set. If `GCP_PROJECT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, or `GCP_SERVICE_ACCOUNT` is empty, a push to `main` prints `Skipping Cloud Run deploy` and finishes successfully. A wrong configuration fails the deploy, and traffic stays on the old revision. The auth step passes `project_id` from `GCP_PROJECT_ID` and the deploy step sets `CLOUDSDK_CORE_PROJECT` from the same variable.
+The repository variables below are set. If `GCP_PROJECT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, or `GCP_SERVICE_ACCOUNT` is empty, a push to `main` prints `Skipping Cloud Run deploy` and finishes successfully. A wrong configuration fails the deploy, and traffic stays on the old revision. The auth step passes `project_id` from `GCP_PROJECT_ID` and the deploy step sets `CLOUDSDK_CORE_PROJECT` from the same variable. The workflow trims spaces around that project id, the Workload Identity provider, the deploy service account, the region, the secret name, and `DATA_BUCKET` before gcloud sees them.
 
 The laptop command in the previous section is the direct deploy (Cloud Build from your machine). It does not do the zero-traffic smoke test. The GitHub workflow is the path that smoke-tests a revision before traffic moves.
 

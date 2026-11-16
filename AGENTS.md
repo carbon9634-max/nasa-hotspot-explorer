@@ -137,7 +137,7 @@ Workload Identity is configured:
 - Pool `github`, provider `nasa-hotspot-explorer`. Tokens are limited to `carbon9634-max/nasa-hotspot-explorer` and `refs/heads/main`.
 - Deploy service account `emberscope-deployer@project-cfcc5008-1013-4766-820.iam.gserviceaccount.com`.
 - Repository variables: `GCP_PROJECT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`. Optional: `GCP_REGION` (default `us-central1`), `FIRMS_SECRET_NAME` (default `FIRMS_MAP_KEY`), `DATA_BUCKET`.
-- `google-github-actions/auth` and `setup-gcloud` both receive `project_id: vars.GCP_PROJECT_ID`. The deploy step also sets `CLOUDSDK_CORE_PROJECT` from that variable. Do not depend on a separate `PROJECT_ID` variable.
+- `google-github-actions/auth` and `setup-gcloud` both receive `project_id` from `GCP_PROJECT_ID`. The deploy step also sets `CLOUDSDK_CORE_PROJECT` from that variable. Do not depend on a separate `PROJECT_ID` variable. Preflight trims surrounding whitespace from the project id, provider, service account, region, secret name, and `DATA_BUCKET`, then passes those strings as job outputs. A trailing space in `GCP_PROJECT_ID` makes gcloud reject the project.
 
 If one of the three required variables is empty, a push to `main` skips deploy and stays green. Do not put the FIRMS key in GitHub. It stays in Secret Manager. Cloud Run service `emberscope-test` was deleted.
 

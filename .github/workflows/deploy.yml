@@ -38,6 +38,12 @@ jobs:
     runs-on: ubuntu-26.04
     outputs:
       configured: ${{ steps.guard.outputs.configured }}
+      project_id: ${{ steps.guard.outputs.project_id }}
+      workload_identity_provider: ${{ steps.guard.outputs.workload_identity_provider }}
+      service_account: ${{ steps.guard.outputs.service_account }}
+      region: ${{ steps.guard.outputs.region }}
+      secret: ${{ steps.guard.outputs.secret }}
+      data_bucket: ${{ steps.guard.outputs.data_bucket }}
     steps:
       - name: Skip cleanly when repository variables are missing
         id: guard
@@ -45,12 +51,40 @@ jobs:
           GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
           GCP_WORKLOAD_IDENTITY_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           GCP_SERVICE_ACCOUNT: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          GCP_REGION: ${{ vars.GCP_REGION }}
+          FIRMS_SECRET_NAME: ${{ vars.FIRMS_SECRET_NAME }}
+          DATA_BUCKET: ${{ vars.DATA_BUCKET }}
         run: |
           set -eu
+          # Repository variables are easy to save with a trailing space. gcloud
+          # then rejects the project id. Trim before any later step sees them.
+          trim() {
+            local value="$1"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "$value"
+          }
+          PROJECT=$(trim "${GCP_PROJECT_ID:-}")
+          PROVIDER=$(trim "${GCP_WORKLOAD_IDENTITY_PROVIDER:-}")
+          ACCOUNT=$(trim "${GCP_SERVICE_ACCOUNT:-}")
+          REGION=$(trim "${GCP_REGION:-}")
+          SECRET=$(trim "${FIRMS_SECRET_NAME:-}")
+          BUCKET=$(trim "${DATA_BUCKET:-}")
+          [ -z "$REGION" ] && REGION="us-central1"
+          [ -z "$SECRET" ] && SECRET="FIRMS_MAP_KEY"
+          [ -z "$BUCKET" ] && BUCKET="emberscope-data-156735151789"
+          {
+            echo "project_id=${PROJECT}"
+            echo "workload_identity_provider=${PROVIDER}"
+            echo "service_account=${ACCOUNT}"
+            echo "region=${REGION}"
+            echo "secret=${SECRET}"
+            echo "data_bucket=${BUCKET}"
+          } >> "$GITHUB_OUTPUT"
           missing=""
-          [ -z "$GCP_PROJECT_ID" ] && missing="$missing GCP_PROJECT_ID"
-          [ -z "$GCP_WORKLOAD_IDENTITY_PROVIDER" ] && missing="$missing GCP_WORKLOAD_IDENTITY_PROVIDER"
-          [ -z "$GCP_SERVICE_ACCOUNT" ] && missing="$missing GCP_SERVICE_ACCOUNT"
+          [ -z "$PROJECT" ] && missing="$missing GCP_PROJECT_ID"
+          [ -z "$PROVIDER" ] && missing="$missing GCP_WORKLOAD_IDENTITY_PROVIDER"
+          [ -z "$ACCOUNT" ] && missing="$missing GCP_SERVICE_ACCOUNT"
           if [ -n "$missing" ]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "Skipping Cloud Run deploy. Set repository variables:$missing"
@@ -72,24 +106,24 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ needs.preflight.outputs.project_id }}
+          workload_identity_provider: ${{ needs.preflight.outputs.workload_identity_provider }}
+          service_account: ${{ needs.preflight.outputs.service_account }}
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v3
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
+          project_id: ${{ needs.preflight.outputs.project_id }}
 
       - name: Build image, smoke-test the new revision, then shift traffic
         env:
-          PROJECT: ${{ vars.GCP_PROJECT_ID }}
-          CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
-          REGION: ${{ vars.GCP_REGION }}
-          SECRET: ${{ vars.FIRMS_SECRET_NAME }}
+          PROJECT: ${{ needs.preflight.outputs.project_id }}
+          CLOUDSDK_CORE_PROJECT: ${{ needs.preflight.outputs.project_id }}
+          REGION: ${{ needs.preflight.outputs.region }}
+          SECRET: ${{ needs.preflight.outputs.secret }}
           SHA: ${{ github.sha }}
           ATTEMPT: ${{ github.run_attempt }}
-          DATA_BUCKET: ${{ vars.DATA_BUCKET || 'emberscope-data-156735151789' }}
+          DATA_BUCKET: ${{ needs.preflight.outputs.data_bucket }}
         run: |
           set -euo pipefail
           REGION="${REGION:-us-central1}"
@@ -210,20 +244,20 @@ jobs:
       - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v3
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
-          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
-          service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ needs.preflight.outputs.project_id }}
+          workload_identity_provider: ${{ needs.preflight.outputs.workload_identity_provider }}
+          service_account: ${{ needs.preflight.outputs.service_account }}
 
       - name: Set up gcloud
         uses: google-github-actions/setup-gcloud@v3
         with:
-          project_id: ${{ vars.GCP_PROJECT_ID }}
+          project_id: ${{ needs.preflight.outputs.project_id }}
 
       - name: Send 100% of traffic to the chosen revision
         env:
-          PROJECT: ${{ vars.GCP_PROJECT_ID }}
-          CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
-          REGION: ${{ vars.GCP_REGION }}
+          PROJECT: ${{ needs.preflight.outputs.project_id }}
+          CLOUDSDK_CORE_PROJECT: ${{ needs.preflight.outputs.project_id }}
+          REGION: ${{ needs.preflight.outputs.region }}
           REVISION: ${{ inputs.revision }}
         run: |
           set -euo pipefail
