@@ -33,7 +33,7 @@ flowchart LR
   App --> Kid
 ```
 
-The ingest job is manual today (`gcloud builds submit` from `ingest/`). GitHub Actions blue-green deploy is written in `.github/workflows/deploy.yml` and turns on after Workload Identity is configured. Until then, deploy the app from the repo root with `gcloud run deploy --source .`.
+The ingest job is manual today (`gcloud builds submit` from `ingest/`). GitHub Actions blue-green deploy is `.github/workflows/deploy.yml`. Workload Identity pool `github` and provider `nasa-hotspot-explorer` are limited to this repo on `refs/heads/main`. A laptop can still deploy from the repo root with `gcloud run deploy --source .`.
 
 ## A person picks a place and a week
 

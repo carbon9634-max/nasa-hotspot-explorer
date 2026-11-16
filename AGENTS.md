@@ -32,7 +32,7 @@ Time ran out for Angular, Go, and Kubernetes. The running app is **Streamlit + p
 - `harmonize.py` is the notebook method, with no Colab or Drive imports.
 - `archive.py` reads the GCS (or local) parquet archive with PyArrow datasets.
 - Live mode calls the FIRMS area API for `VIIRS_SNPP_NRT` and `MODIS_NRT` (last day), cached 10 minutes. A missing key shows a warning and the bundled CSV.
-- `.github/workflows/deploy.yml` is the blue-green workflow. It is **not active** until Workload Identity and the GitHub variables exist. Deploys so far are manual.
+- `.github/workflows/deploy.yml` is the blue-green workflow. Workload Identity pool `github` and provider `nasa-hotspot-explorer` are limited to this repo on `refs/heads/main`. The deploy service account is `emberscope-deployer@project-cfcc5008-1013-4766-820.iam.gserviceaccount.com`.
 - `ingest/` loads the 10-year archive. It is not part of the app image.
 
 Angular, Go, and GKE are the next product step, not a rewrite to start in the middle of a demo fix.
@@ -94,8 +94,8 @@ Point reads: date range of 31 days or any drawn rectangle. Otherwise the app use
 | Region | `us-central1` |
 | App service | `emberscope` |
 | App URL | https://emberscope-156735151789.us-central1.run.app |
-| Test service | `emberscope-test` (delete after CI/CD and blue-green work) |
-| Memory / CPU | 4 GiB, 2 CPU, timeout 300s, max 2 instances |
+| Test service | `emberscope-test` was deleted |
+| Memory / CPU | 4 GiB, 2 CPU, timeout 3600s, min 1 instance, max 2, session affinity |
 | Env | `DATA_BUCKET=emberscope-data-156735151789` |
 | Secret | `FIRMS_MAP_KEY=FIRMS_MAP_KEY:latest` |
 | Runtime SA | `156735151789-compute@developer.gserviceaccount.com` (default compute SA) |
@@ -120,23 +120,26 @@ gcloud run deploy emberscope \
   --allow-unauthenticated \
   --memory 4Gi \
   --cpu 2 \
-  --timeout 300 \
+  --timeout 3600 \
+  --min-instances 1 \
   --max-instances 2 \
+  --session-affinity \
   --set-env-vars DATA_BUCKET=emberscope-data-156735151789 \
   --set-secrets FIRMS_MAP_KEY=FIRMS_MAP_KEY:latest
 ```
 
 Cloud Build builds the Dockerfile. A laptop does not need Docker. Without the Dockerfile, Cloud Run buildpacks fail on this Streamlit app. The first deploy on a fresh project also needs `roles/run.builder` on the default compute service account (`403 storage.objects.get`).
 
-CI/CD file: `.github/workflows/deploy.yml`. On push to `main`, if the GitHub variables are set, it builds an image tagged with the commit SHA, deploys a revision with `--no-traffic` and a preview tag, curls `/_stcore/health` and `/`, then `gcloud run services update-traffic` to send 100% to that revision. A failed smoke test leaves the previous revision in place. `workflow_dispatch` takes a revision name and rolls traffic back.
+CI/CD file: `.github/workflows/deploy.yml`. Jobs run on `ubuntu-26.04`. On push to `main`, if the GitHub variables are set, it builds an image tagged with the commit SHA, deploys a revision with `--no-traffic` and a preview tag, curls `/_stcore/health` and `/`, then `gcloud run services update-traffic` to send 100% to that revision. A failed smoke test leaves the previous revision in place. `workflow_dispatch` takes a revision name and rolls traffic back. The deploy keeps the live flags: `--min-instances 1`, `--session-affinity`, `--timeout 3600`, and `DATA_BUCKET` (repository variable, or `emberscope-data-156735151789` when that variable is empty).
 
-This workflow is **not active yet**. Still needed:
+Workload Identity is configured:
 
-- A Workload Identity Federation pool and provider limited to `carbon9634-max/nasa-hotspot-explorer`.
-- A deploy service account and its roles (see the README GitHub section).
-- Repository variables: `GCP_PROJECT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`. Optional: `GCP_REGION` (default `us-central1`), `FIRMS_SECRET_NAME` (default `FIRMS_MAP_KEY`).
+- Pool `github`, provider `nasa-hotspot-explorer`. Tokens are limited to `carbon9634-max/nasa-hotspot-explorer` and `refs/heads/main`.
+- Deploy service account `emberscope-deployer@project-cfcc5008-1013-4766-820.iam.gserviceaccount.com`.
+- Repository variables: `GCP_PROJECT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, `GCP_SERVICE_ACCOUNT`. Optional: `GCP_REGION` (default `us-central1`), `FIRMS_SECRET_NAME` (default `FIRMS_MAP_KEY`), `DATA_BUCKET`.
+- `google-github-actions/auth` and `setup-gcloud` both receive `project_id: vars.GCP_PROJECT_ID`. The deploy step also sets `CLOUDSDK_CORE_PROJECT` from that variable. Do not depend on a separate `PROJECT_ID` variable.
 
-Until those variables exist, a push to `main` skips deploy and stays green. Do not put the FIRMS key in GitHub. It stays in Secret Manager.
+If one of the three required variables is empty, a push to `main` skips deploy and stays green. Do not put the FIRMS key in GitHub. It stays in Secret Manager. Cloud Run service `emberscope-test` was deleted.
 
 ## Repo map
 
@@ -154,7 +157,7 @@ Until those variables exist, a push to `main` skips deploy and stays green. Do n
 | `Dockerfile` | `python:3.11-slim`, Streamlit on `$PORT` |
 | `.dockerignore` / `.gcloudignore` | Keep git, notebooks, and `ingest/` out of the app image and the Cloud Run upload |
 | `.streamlit/config.toml` | Headless server settings |
-| `.github/workflows/deploy.yml` | Blue-green Cloud Run workflow (not switched on yet) |
+| `.github/workflows/deploy.yml` | Blue-green Cloud Run workflow on `ubuntu-26.04` |
 | `.devcontainer/devcontainer.json` | Codespaces: `streamlit run app.py` |
 | `README.md` | Human quick start, stack, deploy |
 | `docs/ARCHITECTURE.md` | Mermaid diagrams |
@@ -190,15 +193,13 @@ python3 -m unittest test_harmonize.py test_archive.py test_dockerfile.py
 
 ## Known gaps, in order
 
-1. Turn on GitHub blue-green: WIF pool/provider for `carbon9634-max/nasa-hotspot-explorer`, deploy service account, repo variables. Then merge PR #1.
-2. Delete Cloud Run service `emberscope-test` after that path works.
-3. Delete public bucket `emberscope-handoff-156735151789`.
-4. Teach `normalize_manifest` to read ingest’s `date_min` / `date_max` / `rows_by_source` if the flat keys are not added to `manifest.json`.
-5. Scheduled daily NRT ingest (Cloud Scheduler) and a 2026 refresh of `agg/daily_grid.parquet`.
-6. Country zips omit offshore fires; API years include them. Say so anywhere counts are compared across 2025 and 2026.
-7. Performance: global point scans, caching, and the 250k/50k caps.
-8. NOAA-20 and NOAA-21 VIIRS are not in the archive (S-NPP only).
-9. Angular + Go rewrite, then GKE, only after the Cloud Run path is stable.
+1. Delete public bucket `emberscope-handoff-156735151789`.
+2. Teach `normalize_manifest` to read ingest’s `date_min` / `date_max` / `rows_by_source` if the flat keys are not added to `manifest.json`.
+3. Scheduled daily NRT ingest (Cloud Scheduler) and a 2026 refresh of `agg/daily_grid.parquet`.
+4. Country zips omit offshore fires; API years include them. Say so anywhere counts are compared across 2025 and 2026.
+5. Performance: global point scans, caching, and the 250k/50k caps.
+6. NOAA-20 and NOAA-21 VIIRS are not in the archive (S-NPP only).
+7. Angular + Go rewrite, then GKE, only after the Cloud Run path is stable.
 
 ## Conventions
 

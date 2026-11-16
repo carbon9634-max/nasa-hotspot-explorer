@@ -35,7 +35,7 @@ permissions:
 jobs:
   preflight:
     name: Check Google Cloud settings
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     outputs:
       configured: ${{ steps.guard.outputs.configured }}
     steps:
@@ -63,30 +63,33 @@ jobs:
     name: Blue-green deploy emberscope
     needs: preflight
     if: github.event_name == 'push' && needs.preflight.outputs.configured == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 30
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Build image, smoke-test the new revision, then shift traffic
         env:
           PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_REGION }}
           SECRET: ${{ vars.FIRMS_SECRET_NAME }}
           SHA: ${{ github.sha }}
           ATTEMPT: ${{ github.run_attempt }}
+          DATA_BUCKET: ${{ vars.DATA_BUCKET || 'emberscope-data-156735151789' }}
         run: |
           set -euo pipefail
           REGION="${REGION:-us-central1}"
@@ -123,12 +126,16 @@ jobs:
             --platform managed
             --memory 4Gi
             --cpu 2
+            --timeout 3600
+            --min-instances 1
             --max-instances 2
+            --session-affinity
             --tag "$TAG"
             --revision-suffix "$TAG"
             --allow-unauthenticated
             --quiet
             --set-secrets "FIRMS_MAP_KEY=${SECRET}:latest"
+            --update-env-vars "DATA_BUCKET=${DATA_BUCKET}"
           )
           if [ "$FIRST" = "false" ]; then
             deploy_args+=(--no-traffic)
@@ -197,23 +204,25 @@ jobs:
     name: Roll traffic back
     needs: preflight
     if: github.event_name == 'workflow_dispatch' && needs.preflight.outputs.configured == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     steps:
       - name: Authenticate to Google Cloud
-        uses: google-github-actions/auth@v2
+        uses: google-github-actions/auth@v3
         with:
+          project_id: ${{ vars.GCP_PROJECT_ID }}
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
 
       - name: Set up gcloud
-        uses: google-github-actions/setup-gcloud@v2
+        uses: google-github-actions/setup-gcloud@v3
         with:
           project_id: ${{ vars.GCP_PROJECT_ID }}
 
       - name: Send 100% of traffic to the chosen revision
         env:
           PROJECT: ${{ vars.GCP_PROJECT_ID }}
+          CLOUDSDK_CORE_PROJECT: ${{ vars.GCP_PROJECT_ID }}
           REGION: ${{ vars.GCP_REGION }}
           REVISION: ${{ inputs.revision }}
         run: |
