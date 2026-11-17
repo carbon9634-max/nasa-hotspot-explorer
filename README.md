@@ -20,8 +20,8 @@ Live service: https://emberscope-156735151789.us-central1.run.app
 | Processing | `harmonize.py`, `archive.py` | pandas 3.1.1, numpy 2.4.6, pyarrow 26.0.1. k = 5.190318 unless `HARMONIZE_K` is set |
 | App | Streamlit | 1.67.0 on Python 3.11 |
 | Visualization | pydeck, folium, Plotly | pydeck 0.9.3, folium 1.0.0, streamlit-folium 0.27.4, plotly 7.1.0. CARTO Voyager basemap. OpenStreetMap tiles for the draw box |
-| Hosting | Cloud Run, Artifact Registry, Cloud Build | Service `emberscope`, 4 GiB, 2 CPU, timeout 300s, max 2 instances, `us-central1` |
-| CI/CD | GitHub Actions | `.github/workflows/deploy.yml` blue-green. Not switched on until Workload Identity variables exist |
+| Hosting | Cloud Run, Artifact Registry, Cloud Build | Service `emberscope`, 4 GiB, 2 CPU, timeout 3600s, min 1 instance, max 2, session affinity, `us-central1` |
+| CI/CD | GitHub Actions | `.github/workflows/deploy.yml` blue-green on `ubuntu-26.04`. Workload Identity pool `github`, provider `nasa-hotspot-explorer` |
 | Security | Secret Manager | `FIRMS_MAP_KEY` only. Never committed |
 | GCS client in the app | gcsfs, google-cloud-storage | gcsfs 2026.10.1, google-cloud-storage 3.17.1 |
 | Testing | unittest | `test_harmonize.py`, `test_archive.py`, `test_dockerfile.py` |
@@ -171,7 +171,9 @@ gcloud run services update emberscope \
   --region us-central1 \
   --memory 4Gi \
   --cpu 2 \
-  --timeout 300 \
+  --timeout 3600 \
+  --min-instances 1 \
+  --session-affinity \
   --update-env-vars DATA_BUCKET=emberscope-data-156735151789
 ```
 
@@ -301,13 +303,15 @@ gcloud run deploy emberscope \
   --allow-unauthenticated \
   --memory 4Gi \
   --cpu 2 \
-  --timeout 300 \
+  --timeout 3600 \
+  --min-instances 1 \
   --max-instances 2 \
+  --session-affinity \
   --set-env-vars DATA_BUCKET=emberscope-data-156735151789 \
   --set-secrets FIRMS_MAP_KEY=FIRMS_MAP_KEY:latest
 ```
 
-`--memory 4Gi` and `--cpu 2` leave room for a month of points. `--max-instances 2` caps the bill. The container listens on the `PORT` Cloud Run sets (8080). The bundled sample alone fits in 1 GiB. Use 4 GiB when `DATA_BUCKET` is set.
+`--memory 4Gi` and `--cpu 2` leave room for a month of points. `--max-instances 2` caps the bill. `--min-instances 1` keeps one instance warm, and `--session-affinity` sticks a visitor to that instance. The container listens on the `PORT` Cloud Run sets (8080). The bundled sample alone fits in 1 GiB. Use 4 GiB when `DATA_BUCKET` is set. These flags match the live service. The GitHub workflow passes the same ones so a CI deploy does not drop them.
 
 Open the service:
 
@@ -317,7 +321,7 @@ gcloud run services describe emberscope \
   --format='value(status.url)'
 ```
 
-During the demo window you can keep one instance warm, then scale back to zero afterward:
+The live service already keeps one instance warm. Scale back to zero after the demo window:
 
 ```bash
 gcloud run services update emberscope --region "$REGION" --min-instances 1
@@ -366,33 +370,38 @@ gcloud run services update-traffic emberscope \
 
 Example: `--to-revisions emberscope-rabc12341=100`.
 
-Until the three repository variables below are set, a push to `main` does not deploy. The workflow prints `Skipping Cloud Run deploy` and finishes successfully. Set the variables only after Workload Identity Federation is in place. An empty configuration is a skip. A wrong configuration is a failed deploy, and traffic stays on the old revision.
+The repository variables below are set. If `GCP_PROJECT_ID`, `GCP_WORKLOAD_IDENTITY_PROVIDER`, or `GCP_SERVICE_ACCOUNT` is empty, a push to `main` prints `Skipping Cloud Run deploy` and finishes successfully. A wrong configuration fails the deploy, and traffic stays on the old revision. The auth step passes `project_id` from `GCP_PROJECT_ID` and the deploy step sets `CLOUDSDK_CORE_PROJECT` from the same variable. The workflow trims spaces around that project id, the Workload Identity provider, the deploy service account, the region, the secret name, and `DATA_BUCKET` before gcloud sees them.
 
-The laptop command in the previous section is the direct deploy (Cloud Build from your machine). It does not do the zero-traffic smoke test. Use it for the first launch. Use the GitHub workflow once the variables exist.
+The laptop command in the previous section is the direct deploy (Cloud Build from your machine). It does not do the zero-traffic smoke test. The GitHub workflow is the path that smoke-tests a revision before traffic moves.
 
 ## GitHub Actions and Workload Identity
 
 No JSON key is stored in GitHub. The workflow uses Workload Identity Federation. The FIRMS key stays in Secret Manager. The workflow passes it with `--set-secrets FIRMS_MAP_KEY=FIRMS_MAP_KEY:latest`.
 
-Create a pool, a provider locked to this repository, and a deployer service account. `PROJECT_ID` and `PROJECT_NUMBER` are the ones from the deploy section.
+Workload Identity is already in place. The pool is `github`. The provider is `nasa-hotspot-explorer`, and it accepts tokens only from `carbon9634-max/nasa-hotspot-explorer` on `refs/heads/main`. The deploy service account is `emberscope-deployer@project-cfcc5008-1013-4766-820.iam.gserviceaccount.com`. Cloud Run service `emberscope-test` was deleted.
+
+The commands below are what that setup matches.
 
 ```bash
+PROJECT_ID="project-cfcc5008-1013-4766-820"
+PROJECT_NUMBER="156735151789"
+
 gcloud iam workload-identity-pools create github \
   --location=global \
   --display-name="GitHub Actions"
 
-gcloud iam workload-identity-pools providers create-oidc github \
+gcloud iam workload-identity-pools providers create-oidc nasa-hotspot-explorer \
   --location=global \
   --workload-identity-pool=github \
-  --display-name="GitHub" \
+  --display-name="nasa-hotspot-explorer" \
   --issuer-uri="https://token.actions.githubusercontent.com" \
-  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
-  --attribute-condition="assertion.repository=='carbon9634-max/nasa-hotspot-explorer'"
+  --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository,attribute.ref=assertion.ref" \
+  --attribute-condition="assertion.repository=='carbon9634-max/nasa-hotspot-explorer' && assertion.ref=='refs/heads/main'"
 
 gcloud iam service-accounts create emberscope-deployer \
   --display-name="EmberScope GitHub deployer"
 
-DEPLOYER="emberscope-deployer@${PROJECT_ID}.iam.gserviceaccount.com"
+DEPLOYER="emberscope-deployer@project-cfcc5008-1013-4766-820.iam.gserviceaccount.com"
 
 gcloud iam service-accounts add-iam-policy-binding "$DEPLOYER" \
   --role="roles/iam.workloadIdentityUser" \
@@ -415,11 +424,12 @@ In the GitHub repo open **Settings → Secrets and variables → Actions → Var
 
 | Variable | Value |
 | --- | --- |
-| `GCP_PROJECT_ID` | the project id |
-| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/github/providers/github` |
-| `GCP_SERVICE_ACCOUNT` | `emberscope-deployer@PROJECT_ID.iam.gserviceaccount.com` |
+| `GCP_PROJECT_ID` | `project-cfcc5008-1013-4766-820` |
+| `GCP_WORKLOAD_IDENTITY_PROVIDER` | `projects/156735151789/locations/global/workloadIdentityPools/github/providers/nasa-hotspot-explorer` |
+| `GCP_SERVICE_ACCOUNT` | `emberscope-deployer@project-cfcc5008-1013-4766-820.iam.gserviceaccount.com` |
 | `GCP_REGION` | `us-central1` (optional; this is the default) |
 | `FIRMS_SECRET_NAME` | `FIRMS_MAP_KEY` (optional; this is the default) |
+| `DATA_BUCKET` | `emberscope-data-156735151789` (optional; the workflow uses this if the variable is empty) |
 
 These are variables, not secrets. They are resource names. The map key never goes in GitHub.
 
